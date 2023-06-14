@@ -17,8 +17,8 @@ import time
 import wandb
 
 
-from layers.model import HyperDrugRec
-from graph_construction import construct_graphs, graph2hypergraph
+from layers import HyperDrugRec
+from graph_construction import construct_graphs, graph2hypergraph, desc_hypergraph_construction
 from util import llprint, multi_label_metric, ddi_rate_score, buildMPNN, replace_with_padding_woken, multihot2idx
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -49,9 +49,12 @@ def init_wandb(args):
                 "batch_size": args.bsz,
                 "emb_dim": args.dim,
                 "seed": 1203,
+
+                'win_sz': args.win_sz,
+                'n_heads': args.n_heads
             },
 
-            name=f'{args.model_name}_lr_{args.lr}',
+            name=f'{args.model_name}_lr_{args.lr}_win_sz_{args.win_sz}',
 
             # dir
             dir='./saved'
@@ -129,7 +132,7 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
         avg_r.append(adm_avg_r)
         avg_f1.append(adm_avg_f1)
         # ddi rate
-        ddi_rate = ddi_rate_score([y_pred_label], path="../old_data/output/ddi_A_final.pkl")
+        ddi_rate = ddi_rate_score([y_pred_label], path="../data/ddi_A_final.pkl")
         avg_ddi.append(ddi_rate)
 
         med_cnt += y_pred.sum()
@@ -179,6 +182,7 @@ def main():
     ddi_mask_path = '../data/ddi_mask_H.pkl'
     molecule_path = '../data/idx2drug.pkl'
     cache_path = "../data/graphs.pkl"
+    desc_dict_path = '../data/desc_dict.pkl'
 
     device = torch.device("cuda:{}".format(args.cuda))
 
@@ -186,6 +190,7 @@ def main():
     ddi_mask_H = dill.load(open(ddi_mask_path, "rb"))
     data = dill.load(open(data_path, "rb"))
     molecule = dill.load(open(molecule_path, "rb"))
+    desc_dict = dill.load(open(desc_dict_path, 'rb'))
 
     voc = dill.load(open(voc_path, "rb"))
     diag_voc, pro_voc, med_voc = voc["diag_voc"], voc["pro_voc"], voc["med_voc"]
@@ -202,7 +207,7 @@ def main():
 
     train_dataloader = DataLoader(data_train, batch_size=args.bsz, collate_fn=collate_fn,
                                   shuffle=True, pin_memory=True)
-    eval_dataloader = DataLoader(data_eval, batch_size=args.bsz, collate_fn=collate_fn, shuffle=False,
+    eval_dataloader = DataLoader(data_eval, batch_size=args.eval_bsz, collate_fn=collate_fn, shuffle=False,
                                  pin_memory=True)
     # test_dataloader = DataLoader(test_dataset, batch_size=1, collate_fn=pad_batch_v2_eval, shuffle=False,
     #                              pin_memory=True)
@@ -218,10 +223,15 @@ def main():
     }
     adj_dict = construct_graphs(cache_path, data_train, nums_dict=voc_size_dict, k=args.H_k)
 
+    # 构建辅助超图
+    diag_side_adj = desc_hypergraph_construction(desc_dict['diag']['desc2id'], voc_size_dict['diag'])
+    proc_side_adj = desc_hypergraph_construction(desc_dict['proc']['desc2id'], voc_size_dict['proc'])
     adj_dict['ddi_adj'] = torch.FloatTensor(ddi_adj)
-
     h_ddi_adj = graph2hypergraph(adj_dict['ddi_adj'])  # 超图
-    # 将ddi超图和ehr超图结合起来
+
+    # 将辅助超图和ehr超图结合
+    adj_dict['diag'] = torch.cat([adj_dict['diag'], diag_side_adj], dim=-1).coalesce()
+    adj_dict['proc'] = torch.cat([adj_dict['proc'], proc_side_adj], dim=-1).coalesce()
     adj_dict['med'] = torch.cat([adj_dict['med'], h_ddi_adj], dim=-1).coalesce()
 
     padding_dict = {
@@ -302,6 +312,9 @@ def main():
     best_epoch, best_ja = 0, 0
 
     EPOCH = 50
+    if args.debug:
+        EPOCH = 3
+
     for epoch in range(EPOCH):
         tic = time.time()
         print("\nepoch {} --------------------------".format(epoch + 1))
@@ -332,7 +345,7 @@ def main():
             result[result < 0.5] = 0
             y_label = multihot2idx(result)
             current_ddi_rate = ddi_rate_score(
-                [y_label], path="../old_data/output/ddi_A_final.pkl"
+                [y_label], path="../data/ddi_A_final.pkl"
             )
 
 

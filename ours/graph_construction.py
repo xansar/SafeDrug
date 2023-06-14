@@ -13,7 +13,7 @@ import os
 import dgl
 import numpy as np
 import torch
-from tqdm import tqdm
+import dill
 
 
 def factorize_and_recover(H, niter=10, k=10):
@@ -41,7 +41,8 @@ def factorize_and_recover(H, niter=10, k=10):
 def construct_graphs(cache_pth, data_train, nums_dict, k=5):
     name_lst = ['diag', 'proc', 'med']
 
-    if os.path.exists(cache_pth):
+    if False:
+    # if os.path.exists(cache_pth):
         coo_dict = dgl.data.utils.load_info(cache_pth)
     else:
         # 这里要注意，因为模型的embedding有pad token end token在，这里要注意n_diag的实际值
@@ -114,6 +115,24 @@ def graph2hypergraph(adj):
         indices=H_i,
         values=H_v,
         size=(n_nodes, int(n_edges))
+    )
+    return H
+
+def desc_hypergraph_construction(desc2idx_dict, entity_num):
+    indices = []
+    edge_num = 0
+    for desc, idx_lst in desc2idx_dict.items():
+        # 这里需要构建indices,行是实体(idx)列是超边(这里是desc)
+        for idx in idx_lst:
+            indices.append([idx, desc])
+        edge_num += 1
+    indices = np.array(indices, dtype=np.int64).T
+    H_i = torch.from_numpy(indices)
+    H_v = torch.ones(H_i.shape[1])
+    H = torch.sparse_coo_tensor(
+        indices=H_i,
+        values=H_v,
+        size=(entity_num, edge_num)
     )
     return H
 

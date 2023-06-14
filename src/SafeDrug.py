@@ -10,6 +10,7 @@ import time
 from models import SafeDrugModel
 from util import llprint, multi_label_metric, ddi_rate_score, get_n_params, buildMPNN
 import torch.nn.functional as F
+import wandb
 
 torch.manual_seed(1203)
 np.random.seed(2048)
@@ -26,7 +27,8 @@ if not os.path.exists(os.path.join("saved", model_name)):
 
 # Training settings
 parser = argparse.ArgumentParser()
-parser.add_argument('--Test', action='store_true', default=True, help="test mode")
+parser.add_argument('--Test', action='store_true', default=False, help="test mode")
+parser.add_argument('--wandb', action='store_true', default=False, help="use wandb")
 parser.add_argument('--model_name', type=str, default=model_name, help="model name")
 parser.add_argument('--resume_path', type=str, default=resume_path, help='resume path')
 parser.add_argument('--lr', type=float, default=5e-4, help='learning rate')
@@ -35,6 +37,31 @@ parser.add_argument('--kp', type=float, default=0.05, help='coefficient of P sig
 parser.add_argument('--dim', type=int, default=64, help='dimension')
 
 args = parser.parse_args()
+
+def init_wandb(args):
+    # start a new wandb run to track this script
+    if args.wandb:
+        wandb.init(
+            # set the wandb project where this run will be logged
+            project="MLHC",
+            group=args.model_name,
+
+            # track hyperparameters and run metadata
+            config={
+                "learning_rate": args.lr,
+                "architecture": args.model_name,
+                "dataset": "MIMIC-III",
+                "epochs": 50,
+                "batch_size": 1,
+                "emb_dim": args.dim,
+                "seed": 1203,
+            },
+
+            name=f'{args.model_name}_lr_{args.lr}',
+
+            # dir
+            dir='./saved'
+        )
 
 # evaluate
 def eval(model, data_eval, voc_size, epoch):
@@ -89,7 +116,10 @@ def eval(model, data_eval, voc_size, epoch):
     return ddi_rate, np.mean(ja), np.mean(prauc), np.mean(avg_p), np.mean(avg_r), np.mean(avg_f1), med_cnt / visit_cnt
 
 def main():
-    
+
+    if not args.Test:
+        init_wandb(args)
+
     # load data
     data_path = '../data/records_final.pkl'
     voc_path = '../data/voc_final.pkl'
@@ -168,6 +198,7 @@ def main():
         print ('\nepoch {} --------------------------'.format(epoch + 1))
         
         model.train()
+        bce_loss_lst, multi_loss_lst, ddi_loss_lst, total_loss_lst = [[] for _ in range(4)]
         for step, input in enumerate(data_train):
 
             loss = 0
@@ -198,6 +229,11 @@ def main():
                     beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
                     loss = beta * (0.95 * loss_bce + 0.05 * loss_multi) + (1 - beta) * loss_ddi
 
+                bce_loss_lst.append(loss_bce.item())
+                multi_loss_lst.append(loss_multi.item())
+                ddi_loss_lst.append(loss_ddi.item())
+                total_loss_lst.append(loss.item())
+
                 optimizer.zero_grad()
                 loss.backward(retain_graph=True)
                 optimizer.step()
@@ -217,6 +253,21 @@ def main():
         history['prauc'].append(prauc)
         history['med'].append(avg_med)
 
+        if args.wandb:
+            wandb.log({
+                'ja': ja,
+                'ddi_rate': ddi_rate,
+                'avg_p': avg_p,
+                'avg_r': avg_r,
+                'avg_f1': avg_f1,
+                'prauc': prauc,
+                'med': avg_med,
+                'bce_loss': np.mean(bce_loss_lst),
+                'multi_loss': np.mean(multi_loss_lst),
+                'ddi_loss': np.mean(ddi_loss_lst),
+                'total_loss': np.mean(total_loss_lst),
+            })
+
         if epoch >= 5:
             print ('ddi: {}, Med: {}, Ja: {}, F1: {}, PRAUC: {}'.format(
                 np.mean(history['ddi_rate'][-5:]),
@@ -234,6 +285,9 @@ def main():
             best_ja = ja
 
         print ('best_epoch: {}'.format(best_epoch))
+
+    if args.wandb:
+        wandb.finish()
 
     dill.dump(history, open(os.path.join('saved', args.model_name, 'history_{}.pkl'.format(args.model_name)), 'wb'))
 
