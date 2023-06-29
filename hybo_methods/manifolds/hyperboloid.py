@@ -1,7 +1,7 @@
 """Hyperboloid manifold. Copy from https://github.com/HazyResearch/hgcn """
 import torch
-from manifolds.base import Manifold
-from hgcn_utils.math_utils import arcosh, cosh, sinh
+from hybo_methods.manifolds.base import Manifold
+from hybo_methods.hgcn_utils.math_utils import arcosh, cosh, sinh
 
 
 class Hyperboloid(Manifold):
@@ -41,23 +41,24 @@ class Hyperboloid(Manifold):
         K = 1. / c
         d = x.size(-1) - 1
         y = x.narrow(-1, 1, d)
-        y_sqnorm = torch.norm(y, p=2, dim=1, keepdim=True) ** 2
+        y_sqnorm = torch.norm(y, p=2, dim=-1, keepdim=True) ** 2
         mask = torch.ones_like(x)
-        mask[:, 0] = 0
+        mask[..., 0] = 0
         vals = torch.zeros_like(x)
-        vals[:, 0:1] = torch.sqrt(torch.clamp(K + y_sqnorm, min=self.eps[x.dtype]))
+        vals[..., 0:1] = torch.sqrt(torch.clamp(K + y_sqnorm, min=self.eps[x.dtype]))
         return vals + mask * x
 
     def proj_tan(self, u, x, c):
-        d = x.size(1) - 1
-        ux = torch.sum(x.narrow(-1, 1, d) * u.narrow(-1, 1, d), dim=1, keepdim=True)
+        d = x.size(-1) - 1
+        ux = torch.sum(x.narrow(-1, 1, d) * u.narrow(-1, 1, d), dim=-1, keepdim=True)
         mask = torch.ones_like(u)
-        mask[:, 0] = 0
+        mask[..., 0] = 0
         vals = torch.zeros_like(u)
-        vals[:, 0:1] = ux / torch.clamp(x[:, 0:1], min=self.eps[x.dtype])
+        vals[..., 0:1] = ux / torch.clamp(x[..., 0:1], min=self.eps[x.dtype])
         return vals + mask * u
 
     def expmap(self, u, x, c):
+        # assert len(u.shape) == len(x.shape) == 2
         K = 1. / c
         sqrtK = K ** 0.5
         normu = self.minkowski_norm(u)
@@ -68,6 +69,7 @@ class Hyperboloid(Manifold):
         return self.proj(result, c)
 
     def logmap(self, x, y, c):
+        # assert len(x.shape) == len(y.shape) == 2
         K = 1. / c
         xy = torch.clamp(self.minkowski_dot(x, y) + K, max=-self.eps[x.dtype]) - K
         u = y + xy * x * c
@@ -81,25 +83,26 @@ class Hyperboloid(Manifold):
         K = 1. / c
         sqrtK = K ** 0.5
         d = u.size(-1) - 1
-        x = u.narrow(-1, 1, d).view(-1, d)
-        x_norm = torch.norm(x, p=2, dim=1, keepdim=True)
+        x = u.narrow(-1, 1, d)
+        x_norm = torch.norm(x, p=2, dim=-1, keepdim=True)
         x_norm = torch.clamp(x_norm, min=self.min_norm)
         theta = x_norm / sqrtK
         res = torch.ones_like(u)
-        res[:, 0:1] = sqrtK * cosh(theta)
-        res[:, 1:] = sqrtK * sinh(theta) * x / x_norm
+        res[..., 0:1] = sqrtK * cosh(theta)
+        res[..., 1:] = sqrtK * sinh(theta) * x / x_norm
         return self.proj(res, c)
 
     def logmap0(self, x, c):
+        # assert len(x.shape) == 2
         K = 1. / c
         sqrtK = K ** 0.5
         d = x.size(-1) - 1
-        y = x.narrow(-1, 1, d).view(-1, d)
-        y_norm = torch.norm(y, p=2, dim=1, keepdim=True)
+        y = x.narrow(-1, 1, d)
+        y_norm = torch.norm(y, p=2, dim=-1, keepdim=True)
         y_norm = torch.clamp(y_norm, min=self.min_norm)
         res = torch.zeros_like(x)
-        theta = torch.clamp(x[:, 0:1] / sqrtK, min=1.0 + self.eps[x.dtype])
-        res[:, 1:] = sqrtK * arcosh(theta) * y / y_norm
+        theta = torch.clamp(x[..., 0:1] / sqrtK, min=1.0 + self.eps[x.dtype])
+        res[..., 1:] = sqrtK * arcosh(theta) * y / y_norm
         return res
 
     def ptransp(self, x, y, u, c):
@@ -112,10 +115,10 @@ class Hyperboloid(Manifold):
 
     def egrad2rgrad(self, x, grad, k, dim=-1):
         grad.narrow(-1, 0, 1).mul_(-1)
-        grad = grad.addcmul(self.inner(x, grad, dim=dim, keepdim=True), x / k)
+        grad = grad.addcmul(self.inner(x, k, grad, dim=dim, keepdim=True), x / k)
         return grad
 
-    def inner(self, u, v, keepdim: bool = False, dim: int = -1):
+    def inner(self, u, c, v, keepdim: bool = False, dim: int = -1):
         d = u.size(dim) - 1
         uv = u * v
         if keepdim is False:

@@ -1,7 +1,7 @@
 import torch.nn as nn
 
-import layers.hyp_layers as hyp_layers
-import manifolds
+import hybo_methods.layers.hyp_layers as hyp_layers
+import hybo_methods.manifolds as manifolds
 
 
 class Encoder(nn.Module):
@@ -12,9 +12,9 @@ class Encoder(nn.Module):
     def encode(self, x, adj):
         if self.encode_graph:
             input = (x, adj)
-            output, _ = self.layers.forward(input)
+            output, _ = self.layers.forward(input,,
         else:
-            output = self.layers.forward(x)
+            output = self.layers.forward(x,,
         return output
 
 

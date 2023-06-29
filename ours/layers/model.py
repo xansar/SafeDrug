@@ -11,16 +11,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.sparse as tsp
-
+from info_nce import InfoNCE
 from torch_geometric.nn.dense.linear import Linear as pyg_Linear
 from torch_geometric.nn.inits import glorot
 
-from .conv import HypergraphConv
+from .conv import HyperGraphEncoder
 
 
 
 class HyperDrugRec(nn.Module):
-    def __init__(self, voc_size_dict, adj_dict, padding_dict, embedding_dim, n_heads, dropout, device):
+    def __init__(self, voc_size_dict, adj_dict, padding_dict, embedding_dim, n_heads, n_layers, dropout, device):
         super(HyperDrugRec, self).__init__()
         self.name_lst = ['diag', 'proc', 'med']
         self.voc_size_dict = voc_size_dict
@@ -47,32 +47,12 @@ class HyperDrugRec(nn.Module):
         )
         self.graph_encoder = nn.ModuleDict(
             {
-                n: HypergraphConv(
-                    in_channels=embedding_dim,
-                    out_channels=embedding_dim,
-                    use_attention=True,
-                    heads=n_heads, dropout=dropout,
-                    concat=False)
-                for n in self.name_lst
-            }
-        )
-
-        self.layernorm_1 = nn.ModuleDict(
-            {
-                n: nn.LayerNorm(embedding_dim)
-                for n in self.name_lst
-            }
-        )
-        self.layernorm_2 = nn.ModuleDict(
-            {
-                n: nn.LayerNorm(embedding_dim)
-                for n in self.name_lst
-            }
-        )
-
-        self.ffn = nn.ModuleDict(
-            {
-                n: nn.Linear(embedding_dim, embedding_dim)
+                n: HyperGraphEncoder(
+                    embedding_dim=embedding_dim,
+                    n_heads=n_heads,
+                    dropout=dropout,
+                    n_layers=n_layers
+                )
                 for n in self.name_lst
             }
         )
@@ -118,6 +98,8 @@ class HyperDrugRec(nn.Module):
             nn.LayerNorm(embedding_dim),
         )
 
+        self.info_nce_loss = InfoNCE(reduction='none')
+
     def get_embedding(self):
         """
         获取embedding
@@ -162,10 +144,11 @@ class HyperDrugRec(nn.Module):
             x: dict
         """
         for n in self.name_lst:
-            adj_index = adj[n].indices()
-            hyperedge_attr = self.get_hyperedge_representation(x[n], adj[n])
-            x[n] = self.layernorm_1[n](x[n] + self.graph_encoder[n](x[n], adj_index, hyperedge_attr=hyperedge_attr))
-            x[n] = self.layernorm_2[n](x[n] + self.ffn[n](x[n]))
+            x[n] = self.graph_encoder[n](x[n], adj[n])
+            # adj_index = adj[n].indices()
+            # hyperedge_attr = self.get_hyperedge_representation(x[n], adj[n])
+            # x[n] = self.layernorm_1[n](x[n] + self.graph_encoder[n](x[n], adj_index, hyperedge_attr=hyperedge_attr))
+            # x[n] = self.layernorm_2[n](x[n] + self.ffn[n](x[n]))
 
         return x
 
@@ -187,6 +170,18 @@ class HyperDrugRec(nn.Module):
             seq_embed = seq_embed.reshape(bsz * max_vist, max_size, dim)
             visit_seq_embed[n] = self.node2edge_agg[n](seq_embed).reshape(bsz, max_vist, dim)
         return visit_seq_embed
+
+    def SSL(self, view_1_embed, view_2_embed):
+        assert view_1_embed.shape == view_2_embed.shape
+        if len(view_1_embed.shape) > 2:
+            bsz, max_visit, embed_dim = view_1_embed.shape
+            view_1_embed = view_1_embed.reshape(-1, embed_dim)
+            view_2_embed = view_2_embed.reshape(-1, embed_dim)
+            loss = self.info_nce_loss(view_1_embed, view_2_embed)
+            loss = loss.reshape(bsz, max_visit, 1)
+        else:
+            loss = self.info_nce_loss(view_1_embed, view_2_embed)
+        return loss
 
     def forward(self, records, masks):
         """
@@ -236,7 +231,7 @@ class HyperDrugRec(nn.Module):
         attn_mask = masks['attn_mask'].repeat(self.n_heads, 1, 1)
         d_p_rep = self.d_p_seq_attn(
             query=diag_and_proc, key=diag_and_proc, value=diag_and_proc, need_weights=False,
-            # todo: 这里注意,med history的第一个是空的
+            # 这里注意,med history的第一个是空的
             # key_padding_mask=masks['key_padding_mask'],   # 两个mask用一个就行
             # 用来遮挡key中的padding,和key一样的shape,这里应该需要把补足用的visitmask上,bsz_max_visit
             attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
@@ -251,6 +246,7 @@ class HyperDrugRec(nn.Module):
 
         # 下面计算logits,分为两部分,一部分是patient_rep计算,一部分是直接用med计算
         med_embedding = tmp_embedding['med']
+
         patient_output = torch.matmul(patient_rep, med_embedding.T)
         med_output = torch.matmul(med_rep, med_embedding.T)
 
@@ -266,7 +262,14 @@ class HyperDrugRec(nn.Module):
         loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).unsqueeze(-1)
         batch_neg = 0.0005 * (neg_pred_prob.mul(self.tensor_ddi_adj) * loss_mask).sum()
 
-        return output, batch_neg
+        # 计算ssl
+        ssl_loss = (self.SSL(patient_rep, med_rep) * loss_mask.squeeze(-1)).sum() / loss_mask.sum()
+        side_loss = {
+            'ddi': batch_neg,
+            'ssl': ssl_loss
+        }
+
+        return output, side_loss
 
 
 class Node2EdgeAggregator(nn.Module):

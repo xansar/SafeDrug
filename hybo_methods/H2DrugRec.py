@@ -10,14 +10,16 @@
 import dill
 import numpy as np
 from collections import defaultdict
-from torch.optim import Adam
+# from torch.optim import Adam
+from hybo_methods.rgd import RiemannianSGD, RiemannianAdam
 import os
 import torch
 import time
 import wandb
 
 
-from layers import HyperDrugRec
+from hybo_methods.models.hybo_model import H2DrugRec
+from hybo_methods.models.loss_func import H2LossFunc
 from graph_construction import construct_graphs, graph2hypergraph, desc_hypergraph_construction
 from util import llprint, multi_label_metric, ddi_rate_score, buildMPNN, replace_with_padding_woken, multihot2idx
 import torch.nn.functional as F
@@ -49,12 +51,12 @@ def init_wandb(args):
                 "batch_size": args.bsz,
                 "emb_dim": args.dim,
                 "seed": 1203,
-                'n_layers': args.n_layers,
+
                 'win_sz': args.win_sz,
                 'n_heads': args.n_heads
             },
 
-            name=f'{args.model_name}_lr_{args.lr}_win_sz_{args.win_sz}_layers_{args.n_layers}',
+            name=f'{args.model_name}_lr_{args.lr}_win_sz_{args.win_sz}',
 
             # dir
             dir='./saved'
@@ -81,11 +83,11 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
 
         padding_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit).detach().cpu().numpy()
         true_visit_idx = np.where(padding_mask == True)[0]
-        target_output, _ = model(records, masks)
+        output = model(records, masks)
 
         y_gt = targets['loss_bce_target'].detach().cpu().numpy()
 
-        y_pred_prob = F.sigmoid(target_output).detach().cpu().numpy()
+        y_pred_prob = F.sigmoid(output['pos']).detach().cpu().numpy()
 
         y_pred = y_pred_prob.copy()
         y_pred[y_pred >= 0.5] = 1
@@ -198,8 +200,6 @@ def main():
     split_point = int(len(data) * 2 / 3)
     data_train = data[:split_point]
     eval_len = int(len(data[split_point:]) / 2)
-    if not args.debug:
-        assert eval_len > 100
     data_test = data[split_point : split_point + eval_len]
     data_eval = data[split_point + eval_len :]
 
@@ -240,6 +240,7 @@ def main():
         'diag': voc_size_dict['diag'],
         'proc': voc_size_dict['proc'],
         'med': voc_size_dict['med'],
+        'neg_med': voc_size_dict['med'],
     }
     # model = SafeDrugModel(
     #     voc_size,
@@ -251,15 +252,25 @@ def main():
     #     emb_dim=args.dim,
     #     device=device,
     # )
-    model = HyperDrugRec(
+    model = H2DrugRec(
+        c=args.c,
         voc_size_dict=voc_size_dict,
         adj_dict=adj_dict,
         padding_dict=padding_dict,
         embedding_dim=args.dim,
-        n_heads=args.n_heads,
         n_layers=args.n_layers,
+        n_heads=args.n_heads,
         dropout=args.dropout,
+        scale=args.scale,
         device=device
+    )
+    loss_func = H2LossFunc(
+        margin=args.margin,
+        tensor_ddi_adj=adj_dict['ddi_adj'],
+        target_ddi=args.target_ddi,
+        kp=args.kp,
+        multihot2idx=multihot2idx,
+        ddi_rate_score=ddi_rate_score
     )
     # model.load_state_dict(torch.load(open(args.resume_path, 'rb')))
 
@@ -306,9 +317,14 @@ def main():
         return
 
     model.to(device=device)
+    loss_func.to(device=device)
     # print('parameters', get_n_params(model))
     # exit()
-    optimizer = Adam(list(model.parameters()), lr=args.lr)
+    # optimizer = Adam(list(model.parameters()), lr=args.lr)
+    optimizer = RiemannianSGD(params=model.parameters(), lr=args.lr,
+                              weight_decay=args.weight_decay, momentum=args.momentum)
+    # optimizer = RiemannianAdam(params=model.parameters(), lr=args.lr,
+    #                                                 weight_decay=args.weight_decay)
 
     # start iterations
     history = defaultdict(list)
@@ -323,57 +339,60 @@ def main():
         print("\nepoch {} --------------------------".format(epoch + 1))
 
         model.train()
-        bce_loss_lst, multi_loss_lst, ddi_loss_lst, ssl_loss_lst, total_loss_lst = [[] for _ in range(5)]
+        # bce_loss_lst, multi_loss_lst, ddi_loss_lst, total_loss_lst = [[] for _ in range(4)]
+        margin_loss_lst, ddi_loss_lst, total_loss_lst = [[] for _ in range(3)]
         for step, (records, masks, targets) in enumerate(train_dataloader):
             # 做点yu
             records = {k: replace_with_padding_woken(v, -1, padding_dict[k]).to(device) for k, v in records.items()}
             masks = {k: v.to(device) for k, v in masks.items()}
             targets = {k: v.to(device) for k, v in targets.items()}
 
-            result, side_loss = model(records, masks)
-            loss_ddi = side_loss['ddi']
-            loss_ssl = side_loss['ssl']
+            output = model(records, masks)
+            loss_dict = loss_func(output, masks['key_padding_mask']==False)
+            # result, loss_ddi = model(records, masks)
+            # bce_loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).repeat(1, 1, voc_size_dict['med'])
+            #
+            # loss_bce = (F.binary_cross_entropy_with_logits(
+            #     result, targets['loss_bce_target'], reduction='none'
+            # ) * bce_loss_mask).mean()
+            #
+            # bsz, max_visit, _ = result.shape
+            # multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit, -1)
+            # loss_multi = (F.multilabel_margin_loss(
+            #     F.sigmoid(result).reshape(bsz * max_visit, -1), targets['loss_multi_target'].reshape(bsz * max_visit, -1), reduction='none'
+            # ) * multi_loss_mask).mean()
+            #
+            #
+            # result = F.sigmoid(result).detach().cpu().numpy()
+            # result[result >= 0.5] = 1
+            # result[result < 0.5] = 0
+            # y_label = multihot2idx(result)
+            # current_ddi_rate = ddi_rate_score(
+            #     [y_label], path="../data/ddi_A_final.pkl"
+            # )
+            #
+            #
+            #
+            # if current_ddi_rate <= args.target_ddi:
+            #     loss = 0.95 * loss_bce + 0.05 * loss_multi
+            # else:
+            #     beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
+            #     loss = (
+            #         beta * (0.95 * loss_bce + 0.05 * loss_multi)
+            #         + (1 - beta) * loss_ddi
+            #     )
 
-            bce_loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).repeat(1, 1, voc_size_dict['med'])
+            # bce_loss_lst.append(loss_bce.item())
+            # multi_loss_lst.append(loss_multi.item())
+            margin_loss_lst.append(loss_dict['margin'].item())
+            ddi_loss_lst.append(loss_dict['ddi'].item())
+            total_loss_lst.append(loss_dict['total'].item())
 
-            loss_bce = (F.binary_cross_entropy_with_logits(
-                result, targets['loss_bce_target'], reduction='none'
-            ) * bce_loss_mask).mean()
-
-            bsz, max_visit, _ = result.shape
-            multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit, -1)
-            loss_multi = (F.multilabel_margin_loss(
-                F.sigmoid(result).reshape(bsz * max_visit, -1), targets['loss_multi_target'].reshape(bsz * max_visit, -1), reduction='none'
-            ) * multi_loss_mask).mean()
-
-            result = F.sigmoid(result).detach().cpu().numpy()
-            result[result >= 0.5] = 1
-            result[result < 0.5] = 0
-            y_label = multihot2idx(result)
-            current_ddi_rate = ddi_rate_score(
-                [y_label], path="../data/ddi_A_final.pkl"
-            )
-
-
-            alpha = 0.05
-            ssl_weight = 0.1
-            if current_ddi_rate <= args.target_ddi:
-                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl
-            else:
-                beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
-                loss = (
-                    beta * ((1 - alpha) * loss_bce + alpha * loss_multi)
-                    + (1 - beta) * loss_ddi
-                ) + ssl_weight * loss_ssl
-
-            bce_loss_lst.append(loss_bce.item())
-            multi_loss_lst.append(loss_multi.item())
-            ddi_loss_lst.append(loss_ddi.item())
-            ssl_loss_lst.append(loss_ssl.item())
-            total_loss_lst.append(loss.item())
-
+            print(loss_dict)
             optimizer.zero_grad()
-            loss.backward()
+            loss_dict['total'].backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=200, norm_type=2)
+
             optimizer.step()
 
             llprint("\rtraining step: {} / {}".format(step, len(train_dataloader)))
@@ -407,10 +426,10 @@ def main():
                 'avg_f1': avg_f1,
                 'prauc': prauc,
                 'med': avg_med,
-                'bce_loss': np.mean(bce_loss_lst),
-                'multi_loss': np.mean(multi_loss_lst),
+                # 'bce_loss': np.mean(bce_loss_lst),
+                # 'multi_loss': np.mean(multi_loss_lst),
+                'margin_loss': np.mean(margin_loss_lst),
                 'ddi_loss': np.mean(ddi_loss_lst),
-                'ssl_loss': np.mean(ssl_loss_lst),
                 'total_loss': np.mean(total_loss_lst),
             })
 

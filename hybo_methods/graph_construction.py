@@ -13,51 +13,8 @@ import os
 import dgl
 import numpy as np
 import torch
-import torch.sparse as tsp
 import dill
 
-def tf_idf_compute(H, k=5, filter=True):
-    """
-
-    Args:
-        H: 邻接矩阵, 0是item,1是超边,值是顺序
-
-    Returns:
-
-    """
-    n_entities, n_edges = H.shape
-    mask_H = torch.sparse_coo_tensor(H.indices(), torch.ones_like(H.values()), size=H.shape)
-    # 先统计每个entity出现的次数
-    entity_cnt = tsp.sum(mask_H, dim=1).values()  # (n_entities, )
-    # 用边数除以cnt,取log,得到逆频率
-    inverse_entity_freq = torch.log(n_edges / entity_cnt + 1)
-    # 用ndcg的算法计算超边内的顺序权重,用来替换tf
-    assert H.values().min() == 1
-    H_v = 1 / torch.log2(H.values() + 1)
-    entity_idf = inverse_entity_freq[H.indices()[0]]
-    # 将每一个超边的ndcg的值进行归一化处理,使得这些值加起来等于1
-    H_ = torch.sparse_coo_tensor(H.indices(), H_v, size=H.shape).coalesce()
-    # 首先计算每条超边的权重和
-    edge_sum = tsp.sum(H_, dim=0).values()
-    edge_sum = edge_sum[H.indices()[1]]
-    # 计算tf-idf
-    H_v = H_v / edge_sum * entity_idf
-    H_res = torch.sparse_coo_tensor(H.indices(), H_v, size=H.shape).coalesce().to_dense()
-    if filter:
-        v_row, i_row = torch.topk(H_res, k=k, dim=0)
-        v_col, i_col = torch.topk(H_res, k=k, dim=1)
-        row_indices = torch.vstack([i_row.flatten(), torch.arange(n_edges).repeat(k)])
-        col_indices = torch.vstack([torch.arange(n_entities).reshape(-1, 1).repeat(1, k).flatten(), i_col.flatten()])
-        indices = torch.hstack([row_indices, col_indices])
-        values = torch.hstack([v_row.flatten(), v_col.flatten()])
-        key = values != 0   # 只取非0元素
-        indices = indices[:, key]
-        values = values[key]
-        # row_values = v_row.flatten()
-        H_res = torch.sparse_coo_tensor(indices, values, size=H.shape).coalesce()
-    else:
-        H_res = H_res.to_sparse_coo()
-    return H_res
 
 def factorize_and_recover(H, niter=10, k=10):
     """
@@ -105,14 +62,12 @@ def construct_graphs(cache_pth, data_train, nums_dict, k=5):
                     for i in range(3)
                 }
                 hyper_edge = {
-                    # name: sorted(set_dict[name]) for name in name_lst
-                    name: set_dict[name] for name in name_lst
+                    name: sorted(set_dict[name]) for name in name_lst
                 }
 
                 for n in name_lst:
-                    for idx, item in enumerate(hyper_edge[n]):
-                        # coo_dict[n].append([item, visit_num])
-                        coo_dict[n].append([item, visit_num, idx + 1])   # 这里把顺序加进来
+                    for item in hyper_edge[n]:
+                        coo_dict[n].append([item, visit_num])
                     # coo_dict[n].append(hyper_edge[n])
 
                 visit_num += 1
@@ -133,17 +88,14 @@ def construct_graphs(cache_pth, data_train, nums_dict, k=5):
     H_dict = {}
 
     for n in name_lst:
-        # H_i = torch.from_numpy(coo_dict[n])
-        # H_v = torch.ones(H_i.shape[1])
-        H_i = torch.from_numpy(coo_dict[n])[:2, :]
-        H_v = torch.from_numpy(coo_dict[n])[2, :]
+        H_i = torch.from_numpy(coo_dict[n])
+        H_v = torch.ones(H_i.shape[1])
         H = torch.sparse_coo_tensor(
             indices=H_i,
             values=H_v,
             size=(nums_dict[n], int(coo_dict[n].max(1)[1]) + 1)
-        ).coalesce()
-        # H = factorize_and_recover(H, k=k)
-        H = tf_idf_compute(H, filter=False)
+        )
+        H = factorize_and_recover(H, k=k)
         H_dict[n] = H
 
     return H_dict
@@ -163,7 +115,7 @@ def graph2hypergraph(adj):
         indices=H_i,
         values=H_v,
         size=(n_nodes, int(n_edges))
-    ).coalesce()
+    )
     return H
 
 def desc_hypergraph_construction(desc2idx_dict, entity_num):

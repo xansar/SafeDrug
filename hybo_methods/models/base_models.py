@@ -2,9 +2,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-import manifolds
-import models.encoders as encoders
-from utils.helper import default_device
+import hybo_methods.manifolds as manifolds
+import hybo_methods.models.encoders as encoders
+from hybo_methods.utils.helper import default_device
 
 
 class HGCFModel(nn.Module):
@@ -23,6 +23,7 @@ class HGCFModel(nn.Module):
         self.num_layers = args.num_layers
         self.args = args
 
+        # 注意这里的处理
         self.embedding = nn.Embedding(num_embeddings=self.num_users + self.num_items,
                                       embedding_dim=args.embedding_dim).to(default_device())
 

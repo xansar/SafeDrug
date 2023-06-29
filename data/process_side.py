@@ -63,9 +63,9 @@ def idx2icd_desc(icd_pth, voc):
     icd2desc_dict = {}
     for index, row in icd2desc_df.iterrows():
         icd_code = row['ICD9_CODE']
-        short_title = row['SHORT_TITLE']
+        # short_title = row['SHORT_TITLE']
         long_title = row['LONG_TITLE']
-        desc = short_title + '. ' + long_title
+        desc = long_title
         if icd_code in voc.word2idx.keys():
             icd2desc_dict[icd_code] = desc
     # 存在漏的,也就是voc里面有的在这个df里找不到

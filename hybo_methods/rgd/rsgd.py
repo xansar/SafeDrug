@@ -117,10 +117,10 @@ class RiemannianSGD(OptimMixin, torch.optim.SGD):
                             grad = momentum_buffer
 
                         new_point = manifold.expmap(-learning_rate * grad, point, c)
-
-                        components = new_point[:, 1:]
-                        dim0 = torch.sqrt(torch.sum(components * components, dim=1, keepdim=True) + 1)
-                        new_point = torch.cat([dim0, components], dim=1)
+                        # assert len(new_point) >= 2
+                        components = new_point[..., 1:]
+                        dim0 = torch.sqrt(torch.sum(components * components, dim=-1, keepdim=True) + 1)
+                        new_point = torch.cat([dim0, components], dim=-1)
 
                         new_momentum_buffer = manifold.ptransp(point, new_point, momentum_buffer, c)
                         momentum_buffer.set_(new_momentum_buffer)
@@ -131,9 +131,9 @@ class RiemannianSGD(OptimMixin, torch.optim.SGD):
                         # new_point = manifold.retr(point, -learning_rate * grad)
                         new_point = manifold.expmap(-learning_rate * grad, point, c)
 
-                        components = new_point[:, 1:]
-                        dim0 = torch.sqrt(torch.sum(components * components, dim=1, keepdim=True) + 1)
-                        new_point = torch.cat([dim0, components], dim=1)
+                        components = new_point[..., 1:]
+                        dim0 = torch.sqrt(torch.sum(components * components, dim=-1, keepdim=True) + 1)
+                        new_point = torch.cat([dim0, components], dim=-1)
 
                         copy_or_set_(point, new_point)
 
