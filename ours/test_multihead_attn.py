@@ -36,9 +36,9 @@ if __name__ == '__main__':
     ]).repeat(n_heads, 1, 1)
 
 
-    q = torch.randn(bsz, embedding_dim * 2)
-    k = torch.randn(bsz, embedding_dim * 2)
-    v = torch.randn(bsz, embedding_dim)
+    q = torch.randn(bsz, 1, embedding_dim * 2)
+    k = torch.randn(bsz, max_visit, embedding_dim * 2)
+    v = torch.randn(bsz, max_visit, embedding_dim)
     mla = MultiheadAttention(
         embed_dim=embedding_dim * 2,
         kdim=embedding_dim * 2,

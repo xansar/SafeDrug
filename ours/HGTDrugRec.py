@@ -68,13 +68,14 @@ def init_wandb(args):
 
 
 def log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, history, args, bce_loss_lst,
-                 multi_loss_lst, ddi_loss_lst, ssl_loss_lst, total_loss_lst, best_ja, best_epoch):
+                 multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst, best_ja, best_epoch):
     print(
         f'\nLoss: {np.mean(total_loss_lst):.4f}\t'
         f'BCE Loss: {np.mean(bce_loss_lst):.4f}\t'
         f'Multi Loss: {np.mean(multi_loss_lst):.4f}\t'
         f'DDI Loss: {np.mean(ddi_loss_lst):.4f}\t'
-        f'Side Loss: {np.mean(ssl_loss_lst):.4f}')
+        f'SSL Loss: {np.mean(ssl_loss_lst):.4f}\t'
+        f'MoE Loss: {np.mean(moe_loss_lst):.4f}')
     tic2 = time.time()
     ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
         model, eval_dataloader, voc_size, epoch, padding_dict
@@ -106,6 +107,7 @@ def log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, his
             'multi_loss': np.mean(multi_loss_lst),
             'ddi_loss': np.mean(ddi_loss_lst),
             'ssl_loss': np.mean(ssl_loss_lst),
+            'moe_loss': np.mean(moe_loss_lst),
             'total_loss': np.mean(total_loss_lst),
         })
 
@@ -163,7 +165,8 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
 
         padding_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit).detach().cpu().numpy()
         true_visit_idx = np.where(padding_mask == True)[0]
-        target_output, _ = model(records, masks)
+
+        target_output, _ = model(records, masks, torch.from_numpy(true_visit_idx).to(model.device))
 
         y_gt = targets['loss_bce_target'].detach().cpu().numpy()
 
@@ -176,8 +179,7 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
         y_pred_label = multihot2idx(y_pred)
 
         y_gt = y_gt.reshape(bsz * max_visit, -1)[true_visit_idx]
-        y_pred_prob = y_pred_prob.reshape(bsz * max_visit, -1)[true_visit_idx]
-        y_pred = y_pred.reshape(bsz * max_visit, -1)[true_visit_idx]
+        y_pred_prob = y_pred_prob
         y_pred_label = [y_pred_label[n] for n in true_visit_idx.tolist()]
         # for adm_idx, adm in enumerate(input):
         #     # adm: diag, pro, med
@@ -317,7 +319,7 @@ def main():
 
     if args.debug:
         data_train = data_train[:100]
-        data_eval = data_eval[:100]
+        data_eval = data_train[:100]
 
     train_set = MIMICDataset(data_train)
     eval_set = MIMICDataset(data_eval)
@@ -341,8 +343,6 @@ def main():
     #     emb_dim=args.dim,
     #     device=device,
     # )
-    if args.debug:
-        n_ehr_edges = 265
 
     # model.load_state_dict(torch.load(open(args.resume_path, 'rb')))
 
@@ -373,7 +373,7 @@ def main():
         model = torch.nn.parallel.DistributedDataParallel(model,
                                                           device_ids=[local_rank],
                                                           output_device=local_rank,
-                                                          find_unused_parameters=True,
+                                                          find_unused_parameters=False,
                                                           broadcast_buffers=False)
         model.to(device=device)
         if dist.get_rank() == 0:
@@ -462,7 +462,7 @@ def main():
     model.to(device=device)
     # print('parameters', get_n_params(model))
     # exit()
-    optimizer = Adam(list(model.parameters()), lr=args.lr)
+    optimizer = Adam(list(model.parameters()), lr=args.lr, weight_decay=1e-3)
 
     # start iterations
     history = defaultdict(list)
@@ -470,7 +470,7 @@ def main():
 
     EPOCH = 50
     if args.debug:
-        EPOCH = 3
+        EPOCH = 10
 
     for epoch in range(EPOCH):
         if args.ddp:
@@ -485,32 +485,45 @@ def main():
             print('\nepoch {} --------------------------'.format(epoch))
 
         model.train()
-        bce_loss_lst, multi_loss_lst, ddi_loss_lst, ssl_loss_lst, total_loss_lst = [[] for _ in range(5)]
+        bce_loss_lst, multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst = [[] for _ in range(6)]
         for step, (records, masks, targets) in enumerate(train_dataloader):
             # 做点yu
             records = {k: replace_with_padding_woken(v, -1, padding_dict[k]).to(device) for k, v in records.items()}
             masks = {k: v.to(device) for k, v in masks.items()}
             targets = {k: v.to(device) for k, v in targets.items()}
 
-            result, side_loss = model(records, masks)
-            loss_ddi = side_loss['ddi']
-            loss_ssl = side_loss['ssl']
-
-            bsz, max_visit, _ = result.shape
+            bsz, max_visit, _ = records['diag'].shape
             bce_loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).repeat(1, 1,
                                                                                       voc_size_dict['med']).reshape(
                 bsz * max_visit, -1)
             true_visit_idx = bce_loss_mask.sum(-1) != 0
-            loss_bce = (F.binary_cross_entropy_with_logits(
-                result.reshape(bsz * max_visit, -1), targets['loss_bce_target'].reshape(bsz * max_visit, -1),
-                reduction='none'
-            ) * bce_loss_mask)[true_visit_idx].mean()
 
-            multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit)
-            loss_multi = (F.multilabel_margin_loss(
-                F.sigmoid(result).reshape(bsz * max_visit, -1),
-                targets['loss_multi_target'].reshape(bsz * max_visit, -1), reduction='none'
-            )[multi_loss_mask]).mean()
+            result, side_loss = model(records, masks, true_visit_idx)
+            loss_ddi = side_loss['ddi']
+            loss_ssl = side_loss['ssl']
+            loss_moe = side_loss['moe']
+
+            loss_bce = F.binary_cross_entropy_with_logits(
+                result, targets['loss_bce_target'].reshape(bsz * max_visit, -1)[true_visit_idx],
+                reduction='none'
+            ).mean()
+
+            # multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit)
+            loss_multi = F.multilabel_margin_loss(
+                F.sigmoid(result),
+                targets['loss_multi_target'].reshape(bsz * max_visit, -1)[true_visit_idx], reduction='none'
+            ).mean()
+
+            # loss_bce = (F.binary_cross_entropy_with_logits(
+            #     result.reshape(bsz * max_visit, -1), targets['loss_bce_target'].reshape(bsz * max_visit, -1),
+            #     reduction='none'
+            # ) * bce_loss_mask)[true_visit_idx].sum(1).mean()
+            #
+            # multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit)
+            # loss_multi = (F.multilabel_margin_loss(
+            #     F.sigmoid(result).reshape(bsz * max_visit, -1),
+            #     targets['loss_multi_target'].reshape(bsz * max_visit, -1), reduction='none'
+            # )[multi_loss_mask]).mean()
 
             result_binary = F.sigmoid(result).detach().cpu().numpy()
             result_binary[result_binary >= 0.5] = 1
@@ -522,22 +535,37 @@ def main():
 
             alpha = 0.05
             ssl_weight = 0.1
+            moe_weight = 1
             if current_ddi_rate <= args.target_ddi:
-                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl
+                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl + moe_weight * loss_moe
             else:
-                beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
-                loss = (
-                               beta * ((1 - alpha) * loss_bce + alpha * loss_multi)
-                               + (1 - beta) * loss_ddi
-                       ) + ssl_weight * loss_ssl
+                # beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
+                # loss = (
+                #                beta * ((1 - alpha) * loss_bce + alpha * loss_multi)
+                #                + (1 - beta) * loss_ddi
+                #        ) + ssl_weight * loss_ssl
+                # beta = (current_ddi_rate - args.target_ddi) / args.kp
+                beta = 0.1
+                loss_ddi = beta * loss_ddi
+                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl + loss_ddi + moe_weight * loss_moe
+            # if current_ddi_rate <= args.target_ddi:
+            #     loss = (1 - alpha) * loss_bce + alpha * loss_multi
+            # else:
+            #     beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
+            #     loss = (
+            #                    beta * ((1 - alpha) * loss_bce + alpha * loss_multi)
+            #                    + (1 - beta) * loss_ddi
+            #            )
 
             bce_loss_lst.append(loss_bce.item())
             multi_loss_lst.append(loss_multi.item())
             ddi_loss_lst.append(loss_ddi.item())
             ssl_loss_lst.append(loss_ssl.item())
+            moe_loss_lst.append(loss_moe.item())
             total_loss_lst.append(loss.item())
 
             optimizer.zero_grad()
+            # print(loss_bce.item())
             loss.backward()
             optimizer.step()
 
@@ -547,12 +575,12 @@ def main():
                 best_epoch, best_ja = log_and_eval(model.module,
                                                    eval_dataloader, voc_size, epoch, padding_dict, tic, history,
                                                    args, bce_loss_lst,
-                                                   multi_loss_lst, ddi_loss_lst, ssl_loss_lst, total_loss_lst, best_ja,
+                                                   multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst, best_ja,
                                                    best_epoch)
         else:
             best_epoch, best_ja = log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, history,
                                                args, bce_loss_lst,
-                                               multi_loss_lst, ddi_loss_lst, ssl_loss_lst, total_loss_lst, best_ja,
+                                               multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst, best_ja,
                                                best_epoch)
 
         # print()

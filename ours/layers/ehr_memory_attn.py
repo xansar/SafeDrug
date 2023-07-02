@@ -33,7 +33,7 @@ class EHRMemoryAttention(nn.Module):
         self.dropout1 = nn.Dropout(dropout)
         self.dropout2 = nn.Dropout(dropout)
 
-        self.activation = nn.GELU()
+        self.activation = nn.LeakyReLU()
 
     def forward(self, visit_rep, E_mem):
         """
@@ -55,8 +55,8 @@ class EHRMemoryAttention(nn.Module):
 
     # self-attention block
     def _att_block(self, x, k, v):
-        x = self.visit_mem_attn(x, k, v,
-                           need_weights=False)[0]
+        x, attn = self.visit_mem_attn(x, k, v,
+                           need_weights=True)
         return self.dropout1(x)
 
     # feed forward block

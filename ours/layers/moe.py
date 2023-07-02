@@ -135,7 +135,7 @@ class MLP(nn.Module):
     def forward(self, x):
         out = self.fc1(x)
         out = self.relu(out)
-        out = self.fc2(out)
+        out = self.fc2(out) + x
         # out = self.soft(out)
         return out
 

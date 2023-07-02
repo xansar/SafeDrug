@@ -44,8 +44,11 @@ def collate_fn(X):
     loss_multi_target = torch.full((batch_size, max_T, ARGS.med_sz), -1)
 
     key_padding_mask = torch.zeros(batch_size, max_T).bool()
-    attn_mask = torch.triu(torch.ones(batch_size, max_T, max_T), diagonal=1).bool()
-    attn_mask += torch.tril(torch.ones(batch_size, max_T, max_T), diagonal=-ARGS.win_sz).bool()
+    # attn_mask = torch.triu(torch.ones(batch_size, max_T, max_T), diagonal=1).bool()
+    # attn_mask += torch.tril(torch.ones(batch_size, max_T, max_T), diagonal=-ARGS.win_sz).bool()
+
+    attn_mask = torch.triu(torch.ones(batch_size * max_T, batch_size * max_T), diagonal=1).bool()
+    attn_mask += torch.tril(torch.ones(batch_size * max_T, batch_size * max_T), diagonal=-ARGS.win_sz).bool()
 
     for i, x in enumerate(X):
         cur_diag = []
@@ -53,9 +56,9 @@ def collate_fn(X):
         cur_drug = []
 
         key_padding_mask[i, length[i]:] = True
-        attn_mask[i, length[i]:, :] = True
-        attn_mask[i, :, length[i]:] = True
-        attn_mask[i, torch.arange(max_T), torch.arange(max_T)] = False
+        # attn_mask[i, length[i]:, :] = True
+        # attn_mask[i, :, length[i]:] = True
+        # attn_mask[i, torch.arange(max_T), torch.arange(max_T)] = False
 
 
         for j, v in enumerate(x):  # 遍历每个visit

@@ -409,8 +409,7 @@ def replace_with_padding_woken(data, org_pad_token, target_value):
 
 def multihot2idx(multihot_batch):
     target = []
-    for patient in multihot_batch:
-        for visit in patient:
-            target.append(np.where(visit == 1)[0])
+    for visit in multihot_batch:
+        target.append(np.where(visit == 1)[0])
 
     return target

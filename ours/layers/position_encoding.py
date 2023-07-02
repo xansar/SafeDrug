@@ -28,6 +28,7 @@ class HypergraphStructureEncoding(nn.Module):
             self.encodings = encodings
         self.encodings = self.encodings.to(device)
 
+        self.norm = nn.BatchNorm1d(len(statistics_name) + 1)
         self.proj = nn.Linear(len(statistics_name) + 1, se_dim)
 
     def compute_node_degree(self):
@@ -83,7 +84,7 @@ class HypergraphStructureEncoding(nn.Module):
                 if n == 'mode':
                     value = getattr(torch, n)(local_sizes)[0] - global_statistics[n]
                 elif n == 'var' and len(local_sizes) == 1:
-                    var = getattr(torch, n)(local_sizes)    # nan当0
+                    var = getattr(torch, n)(local_sizes)  # nan当0
                     value = -global_statistics[n]
                 else:
                     value = getattr(torch, n)(local_sizes) - global_statistics[n]
@@ -96,7 +97,7 @@ class HypergraphStructureEncoding(nn.Module):
         return structure_encodings
 
     def forward(self):
-        return self.proj(self.encodings)
+        return self.proj(self.norm(self.encodings))
 
 
 class HypergraphKnowledgeEncoding(nn.Module):
@@ -127,6 +128,7 @@ class HypergraphKnowledgeEncoding(nn.Module):
 
         max_dist = torch.max(self.ke_dist_matrix).long().item()
         self.encoding = nn.Embedding(max_dist + 1, 1)
+        self.norm = nn.BatchNorm1d(self.n_nodes)
         self.proj = nn.Linear(self.n_nodes, ke_dim)
 
     def icd_dist(self, u, v):
@@ -190,7 +192,7 @@ class HypergraphKnowledgeEncoding(nn.Module):
 
     def forward(self):
         ke_bias = self.encoding(self.ke_dist_matrix).reshape(self.n_nodes, self.n_nodes)
-        return self.proj(ke_bias), ke_bias
+        return self.proj(self.norm(ke_bias)), ke_bias
 
 
 class HypergraphPositionEncoding(nn.Module):
@@ -209,10 +211,12 @@ class HypergraphPositionEncoding(nn.Module):
         if os.path.exists(cache_pth):
             self.encodings = torch.load(cache_pth)
         else:
-            encodings = self.svd_lowrank_decomposition()
+            encodings = self.svd_decomposition()
             torch.save(encodings, cache_pth)
             self.encodings = encodings
         self.encodings = self.encodings.to(device)
+
+        self.norm = nn.BatchNorm1d(self.pe_dim * 2)
         self.proj = nn.Linear(self.pe_dim * 2, self.pe_dim)
 
     def compute_laplacian_matrix(self):
@@ -239,7 +243,7 @@ class HypergraphPositionEncoding(nn.Module):
         L = torch.eye(n) - torch.matmul(D_v_inv_sqrt, H @ W @ torch.matmul(D_e_inv, H.T @ D_v_inv_sqrt))
         return L
 
-    def svd_lowrank_decomposition(self):
+    def svd_decomposition(self):
         L = self.compute_laplacian_matrix()
         U, S, V = torch.svd(L)
         # 选取最大的r个奇异值与奇异向量
@@ -256,17 +260,22 @@ class HypergraphPositionEncoding(nn.Module):
         signs = torch.tensor([-1, 1])
         idx = torch.randint(0, 2, (self.n_nodes,))
         signs_idx = signs[idx].reshape(self.n_nodes, 1).to(self.encodings.device)
-        return self.proj(self.encodings * signs_idx)
+        return self.proj(self.norm(self.encodings * signs_idx))
+
 
 class FeatureEncoder(nn.Module):
     """
     用来整合位置编码,结构编码,知识编码
     """
+
     def __init__(self, H, idx2word, se_dim, pe_dim, ke_dim, cache_dir, device, name):
         super(FeatureEncoder, self).__init__()
-        self.se_encoding = HypergraphStructureEncoding(H, se_dim, os.path.join(cache_dir, 'se_encoding.pth'), device, name)
-        self.pe_encoding = HypergraphPositionEncoding(H, pe_dim, os.path.join(cache_dir, 'pe_encoding.pth'), device, name)
-        self.ke_encoding = HypergraphKnowledgeEncoding(idx2word, ke_dim, os.path.join(cache_dir, 'ke_encoding.pth'), device, name)
+        self.se_encoding = HypergraphStructureEncoding(H, se_dim, os.path.join(cache_dir, 'se_encoding.pth'), device,
+                                                       name)
+        self.pe_encoding = HypergraphPositionEncoding(H, pe_dim, os.path.join(cache_dir, 'pe_encoding.pth'), device,
+                                                      name)
+        self.ke_encoding = HypergraphKnowledgeEncoding(idx2word, ke_dim, os.path.join(cache_dir, 'ke_encoding.pth'),
+                                                       device, name)
         self.name = name
 
     def forward(self):
@@ -280,6 +289,7 @@ class FeatureEncoder(nn.Module):
             'pe': pe_encoding
         }
         return encodings, ke_bias
+
 
 class HypergraphRandomWalkPositionEncoding(nn.Module):
     def __init__(self, max_step, pos_enc_dim):

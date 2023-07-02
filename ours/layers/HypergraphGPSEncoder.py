@@ -133,6 +133,7 @@ class HypergraphGPSEncoderLayer(nn.Module):
         self.node_ff_block = FeedForwardLayer(embed_dim, dropout)
         self.node_norm = nn.BatchNorm1d(embed_dim)
 
+        self.edge_norm = nn.BatchNorm1d(embed_dim)
     def forward(self, input_params, ke_bias):
         """
 
@@ -145,13 +146,14 @@ class HypergraphGPSEncoderLayer(nn.Module):
 
         """
         X, E, A = input_params
-        X_M_hat, E_res = self.MPNN_layer(X, E, A)
+        X_M_hat, E_res_hat = self.MPNN_layer(X, E, A)
+        E_res = self.edge_norm(E_res_hat)
         X_M = self.local_bn(self.local_dropout(X_M_hat) + X)
 
         X_T_hat = self.global_att(X, ke_bias)
         X_T = self.global_bn(self.global_dropout(X_T_hat) + X)
 
-        X_res = self.node_norm(self.node_ff_block(X_M + X_T) + X)
+        X_res = self.node_norm(self.node_ff_block(X_M + X_T) + X_M + X_T)
         output = (X_res, E_res, A)
         return output
 
@@ -185,6 +187,9 @@ class HypergraphGPSEncoder(nn.Module):
                 )
             )
 
+        self.node_norm = nn.BatchNorm1d(embed_dim)
+        self.edge_norm = nn.BatchNorm1d(embed_dim)
+
     def forward(self, X, E, H):
         """
 
@@ -211,4 +216,46 @@ class HypergraphGPSEncoder(nn.Module):
         X = sum(X_lst) / (self.n_layers + 1)
         E = sum(E_lst) / (self.n_layers + 1)
 
+        X = self.node_norm(X)
+        E = self.edge_norm(E)
+
         return X, E
+
+
+class Node2EdgeAggregator(nn.Module):
+    def __init__(self, embed_dim, n_heads, dropout):
+        super(Node2EdgeAggregator, self).__init__()
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.mha = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self._ff_block = FeedForwardLayer(embed_dim, dropout)
+    def forward(self, x):
+        """
+
+        Args:
+            x: bsz, max_size, dim
+
+        Returns:
+
+        """
+        # 首先使用平均计算超边表示,然后将节点表示和超边表示拼接起来计算注意力
+        bsz, max_size, dim = x.shape
+        hyperedge_attr = x.mean(1, keepdim=True)   # bsz, 1, dim
+        attn_visit = self._sa_block(hyperedge_attr, x, x)
+        out = self._ff_block(attn_visit)
+        return out
+
+    def _sa_block(self, q, k, v):
+        attn_visit, attn = self.mha(
+            query=q,
+            key=k,
+            value=v,
+            need_weights=True
+        )
+        return attn_visit

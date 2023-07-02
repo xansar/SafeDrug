@@ -16,7 +16,7 @@ from torch_geometric.nn.dense.linear import Linear as pyg_Linear
 from torch_geometric.nn.inits import glorot
 
 # from .conv import HyperGraphEncoder
-from .HypergraphGPSEncoder import HypergraphGPSEncoder
+from .HypergraphGPSEncoder import HypergraphGPSEncoder, Node2EdgeAggregator
 from .moe import MoEPredictor
 from .ehr_memory_attn import EHRMemoryAttention
 
@@ -24,7 +24,8 @@ import faiss
 
 
 class HGTDrugRec(nn.Module):
-    def __init__(self, voc_size_dict, adj_dict, padding_dict, voc_dict, n_ehr_edges, embedding_dim, n_heads, n_layers, n_protos, n_experts,
+    def __init__(self, voc_size_dict, adj_dict, padding_dict, voc_dict, n_ehr_edges, embedding_dim, n_heads, n_layers,
+                 n_protos, n_experts,
                  dropout, device, cache_dir):
         super(HGTDrugRec, self).__init__()
         self.graph_embed_cache = None
@@ -50,6 +51,12 @@ class HGTDrugRec(nn.Module):
                     num_embeddings=self.num_dict[n] + 1,
                     embedding_dim=embedding_dim,
                     padding_idx=self.padding_dict[n])
+                for n in self.name_lst
+            }
+        )
+        self.embedding_norm = nn.ModuleDict(
+            {
+                n: nn.BatchNorm1d(embedding_dim)
                 for n in self.name_lst
             }
         )
@@ -84,7 +91,7 @@ class HGTDrugRec(nn.Module):
 
         self.node2edge_agg = nn.ModuleDict(
             {
-                n: Node2EdgeAggregator(embedding_dim, embedding_dim, n_heads, dropout)
+                n: Node2EdgeAggregator(embedding_dim, n_heads, dropout)
                 for n in self.name_lst
             }
         )
@@ -143,16 +150,18 @@ class HGTDrugRec(nn.Module):
         self.output_mlp = nn.Sequential(
             nn.Linear(3 * embedding_dim, embedding_dim),
             nn.LeakyReLU(),
-            nn.LayerNorm(embedding_dim),    # 这里不能用batch,因为有空的visit
+            nn.BatchNorm1d(embedding_dim),  # 这里不能用batch,因为有空的visit
         )
 
-        self.output_layernorm = nn.LayerNorm(self.voc_size_dict['med'])
+        self.output_norm = nn.BatchNorm1d(self.voc_size_dict['med'])
 
         self.moe_preditor = MoEPredictor(
             embed_dim=voc_size_dict['med'],
             output_size=voc_size_dict['med'],
             n_experts=n_experts
         )
+
+        self.pred_norm = nn.BatchNorm1d(self.voc_size_dict['med'])
         # self.d_p_seq_attn = nn.MultiheadAttention(
         #     embed_dim=embedding_dim,
         #     num_heads=n_heads,
@@ -176,7 +185,7 @@ class HGTDrugRec(nn.Module):
         #     nn.LayerNorm(embedding_dim),
         # )
 
-        # self.info_nce_loss = InfoNCE(reduction='none')
+        self.info_nce_loss = InfoNCE(reduction='none')
 
     def get_embedding(self):
         """
@@ -187,7 +196,7 @@ class HGTDrugRec(nn.Module):
         x = {}
         for n in self.name_lst:
             idx = torch.arange(self.num_dict[n], dtype=torch.long, device=self.device)
-            x[n] = self.embedding[n](idx)
+            x[n] = self.embedding_norm[n](self.embedding[n](idx))
         return x
 
     def get_hyperedge_representation(self, embed, adj):
@@ -259,17 +268,15 @@ class HGTDrugRec(nn.Module):
             visit_seq_embed[n] = self.node2edge_agg[n](seq_embed).reshape(bsz, max_vist, dim)
         return visit_seq_embed
 
-    def SSL(self, view_1_embed, view_2_embed):
-        assert view_1_embed.shape == view_2_embed.shape
-        if len(view_1_embed.shape) > 2:
-            bsz, max_visit, embed_dim = view_1_embed.shape
-            view_1_embed = view_1_embed.reshape(-1, embed_dim)
-            view_2_embed = view_2_embed.reshape(-1, embed_dim)
-            loss = self.info_nce_loss(view_1_embed, view_2_embed)
-            loss = loss.reshape(bsz, max_visit, 1)
-        else:
-            loss = self.info_nce_loss(view_1_embed, view_2_embed)
-        return loss
+    def DPM_SSL(self, E):
+        D, P, M = E['diag'][:self.n_ehr_edges], E['proc'][:self.n_ehr_edges], E['med'][:self.n_ehr_edges]
+        assert D.shape == P.shape == M.shape
+        dp_ssl_loss = self.info_nce_loss(D, P)
+        dm_ssl_loss = self.info_nce_loss(D, M)
+        pm_ssl_loss = self.info_nce_loss(P, M)
+        loss = dp_ssl_loss + dm_ssl_loss + pm_ssl_loss
+        return loss.mean()
+
     def edges_cluster(self, x):
         """Run K-means algorithm to get k clusters of the input tensor x
         https://github.com/RUCAIBox/NCL/blob/master/ncl.py
@@ -301,13 +308,14 @@ class HGTDrugRec(nn.Module):
             X_hat[n] = torch.vstack([X_hat[n], padding_row])
         self.graph_embed_cache = X_hat, E_hat, E_mem
 
-    def forward(self, records, masks):
+    def forward(self, records, masks, true_visit_idx):
         """
 
         Args:
             records: dict(diag, proc, med),其中每个元素shape为(bsz, max_vist, max_name_size)
                     对齐方式上,diag^t,proc^t和med^(t-1)对齐,第一次的med使用pad补
             masks: 多头注意力用
+            true_visit_idx: 用来过滤空的visit
 
         Returns:
 
@@ -326,7 +334,11 @@ class HGTDrugRec(nn.Module):
         else:
             X_hat, E_hat, E_mem = self.graph_embed_cache
 
-            # 解析序列数据
+        # 自监督损失
+        ## 三个领域相互做ssl
+        ssl_loss = self.DPM_SSL(E_hat)
+
+        # 解析序列数据
         entity_seq_embed = {}  # (bsz, max_vist, max_size, dim)
         for n in self.name_lst:
             entity_seq_embed[n] = X_hat[n][records[n]]
@@ -348,31 +360,38 @@ class HGTDrugRec(nn.Module):
 
         # 用多头注意力,当前为q,图上的超边为k和v
         visit_rep = visit_rep.reshape(batch_size * max_visit, dim * 3)
+        visit_rep = visit_rep[true_visit_idx]   # 只保留非空的visit
         visit_rep_mem = self.visit_mem_attn(
             visit_rep, E_mem
         )
 
         # 计算包含上下文信息的表示
-        attn_mask = masks['attn_mask'].repeat(self.n_heads, 1, 1)
-        visit_rep_mem = visit_rep_mem.reshape(batch_size, max_visit, dim * 3)
+        # attn_mask = masks['attn_mask'].repeat(self.n_heads, 1, 1)
+        attn_mask = masks['attn_mask']
+        attn_mask = attn_mask[true_visit_idx][:, true_visit_idx]
+        assert attn_mask.shape == (visit_rep_mem.shape[0], visit_rep_mem.shape[0])
+        # visit_rep_mem = visit_rep_mem.reshape(batch_size, max_visit, dim * 3)
 
-        context_rep = self.context_attn(
-            query=visit_rep_mem, key=visit_rep_mem, value=visit_rep_mem, need_weights=False,
+        context_rep, context_attn = self.context_attn(
+            query=visit_rep_mem, key=visit_rep_mem, value=visit_rep_mem, need_weights=True,
             # key_padding_mask=masks['key_padding_mask'],
             # 用来遮挡key中的padding,和key一样的shape,这里应该需要把补足用的visitmask上,bsz_max_visit
             attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
-        )[0]
+        )
         context_rep = self.output_mlp(context_rep)
         # 这里直接接MoE输出预测
         med_embedding = X_hat['med']
         # 这里要注意,最后一列是padding,需要去掉
-        dot_output = torch.matmul(context_rep, med_embedding.T)[:, :, :-1]
-        dot_output = dot_output.reshape(batch_size * max_visit, -1)
-        dot_output = self.output_layernorm(dot_output)
+        dot_output = torch.matmul(context_rep, med_embedding.T)[:, :-1]
+        # dot_output = dot_output.reshape(batch_size * max_visit, -1)
+        dot_output = self.output_norm(dot_output)
         output, moe_loss = self.moe_preditor(dot_output)
+        output = self.pred_norm(output)
+        # output = dot_output
+        # moe_loss = dot_output.mean()
 
         # output = torch.matmul(context_rep, med_embedding.T)[:, :, :-1]
-        output = output.reshape(batch_size, max_visit, -1)
+        # output = output.reshape(batch_size, max_visit, -1)
         #
         #
         # # 解码还是使用多头注意力,当前时刻的diag和proc作为query, 过去时刻的diag和proc作为key,过去时刻的med作为value
@@ -410,10 +429,10 @@ class HGTDrugRec(nn.Module):
         # 计算ddi-loss
         neg_pred_prob = F.sigmoid(output)
         neg_pred_prob = neg_pred_prob.unsqueeze(-1)
-        neg_pred_prob = neg_pred_prob.transpose(-1, -2) * neg_pred_prob  # (bsz, max_visit, voc_size, voc_size)
+        neg_pred_prob = neg_pred_prob.transpose(-1, -2) * neg_pred_prob  # (true visit num, voc_size, voc_size)
 
-        loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).unsqueeze(-1)
-        batch_neg = 0.0005 * (neg_pred_prob.mul(self.tensor_ddi_adj) * loss_mask).sum()
+        # loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).unsqueeze(-1)
+        batch_neg = 0.0005 * neg_pred_prob.mul(self.tensor_ddi_adj).sum()
 
         # 计算ssl
         # ssl_loss = (self.SSL(patient_rep, med_rep) * loss_mask.squeeze(-1)).sum() / loss_mask.sum()
@@ -424,50 +443,52 @@ class HGTDrugRec(nn.Module):
         # 计算ssl
         side_loss = {
             'ddi': batch_neg,
-            'ssl': moe_loss
+            'ssl': ssl_loss,
+            'moe': moe_loss
         }
 
         return output, side_loss
 
 
-class Node2EdgeAggregator(nn.Module):
-    def __init__(self, in_channels, out_channels, n_heads, dropout):
-        super(Node2EdgeAggregator, self).__init__()
-        self.in_channels = in_channels
-        self.out_channels = out_channels
-        self.n_heads = n_heads
-        self.out_dim = out_channels // n_heads  # 分头后的空间
-        self.dropout = dropout
+# class Node2EdgeAggregator(nn.Module):
+#     def __init__(self, in_channels, out_channels, n_heads, dropout):
+#         super(Node2EdgeAggregator, self).__init__()
+#         self.in_channels = in_channels
+#         self.out_channels = out_channels
+#         self.n_heads = n_heads
+#         self.out_dim = out_channels // n_heads  # 分头后的空间
+#         self.dropout = dropout
+#
+#         self.lin = pyg_Linear(self.out_dim, self.out_dim, bias=False,
+#                               weight_initializer='glorot')
+#         self.att = nn.Parameter(torch.Tensor(1, n_heads, 2 * self.out_dim))
+#         glorot(self.att)
+#
+#     def forward(self, x):
+#         """
+#
+#         Args:
+#             x: bsz, max_size, dim
+#
+#         Returns:
+#
+#         """
+#         # 首先使用平均计算超边表示,然后将节点表示和超边表示拼接起来计算注意力
+#         bsz, max_size, dim = x.shape
+#         x = x.reshape(-1, max_size, self.n_heads, self.out_channels // self.n_heads)  # bsz, max_size, head, out_dim
+#         x = self.lin(x)  # bsz, max_size, dim
+#
+#         hyperedge_attr = x.mean(1)  # bsz, dim
+#         hyperedge_attr = self.lin(hyperedge_attr)
+#         hyperedge_attr = hyperedge_attr.reshape(-1, self.n_heads, self.out_channels // self.n_heads)
+#         hyperedge_attr = hyperedge_attr.unsqueeze(1).repeat(1, max_size, 1, 1)  # bsz, max_size, head, out_dim
+#
+#         # 跟x拼接起来
+#         alpha = (torch.cat([x, hyperedge_attr], dim=-1) * self.att).sum(dim=-1)  # bsz, max_size, head
+#         alpha = F.leaky_relu(alpha)  # bsz, max_size, head
+#         alpha = torch.softmax(alpha, dim=1)  # bsz, max_size, head
+#         alpha = F.dropout(alpha, p=self.dropout, training=self.training).unsqueeze(-1)  # bsz, max_size, head, 1
+#         out = (alpha * x).sum(1)  # bsz, head, out_dim
+#         out = out.reshape(-1, self.out_channels)  # bsz, dim
+#         return out
 
-        self.lin = pyg_Linear(self.out_dim, self.out_dim, bias=False,
-                              weight_initializer='glorot')
-        self.att = nn.Parameter(torch.Tensor(1, n_heads, 2 * self.out_dim))
-        glorot(self.att)
-
-    def forward(self, x):
-        """
-
-        Args:
-            x: bsz, max_size, dim
-
-        Returns:
-
-        """
-        # 首先使用平均计算超边表示,然后将节点表示和超边表示拼接起来计算注意力
-        bsz, max_size, dim = x.shape
-        x = x.reshape(-1, max_size, self.n_heads, self.out_channels // self.n_heads)  # bsz, max_size, head, out_dim
-        x = self.lin(x)  # bsz, max_size, dim
-
-        hyperedge_attr = x.mean(1)  # bsz, dim
-        hyperedge_attr = self.lin(hyperedge_attr)
-        hyperedge_attr = hyperedge_attr.reshape(-1, self.n_heads, self.out_channels // self.n_heads)
-        hyperedge_attr = hyperedge_attr.unsqueeze(1).repeat(1, max_size, 1, 1)  # bsz, max_size, head, out_dim
-
-        # 跟x拼接起来
-        alpha = (torch.cat([x, hyperedge_attr], dim=-1) * self.att).sum(dim=-1)  # bsz, max_size, head
-        alpha = F.leaky_relu(alpha)  # bsz, max_size, head
-        alpha = torch.softmax(alpha, dim=1)  # bsz, max_size, head
-        alpha = F.dropout(alpha, p=self.dropout, training=self.training).unsqueeze(-1)  # bsz, max_size, head, 1
-        out = (alpha * x).sum(1)  # bsz, head, out_dim
-        out = out.reshape(-1, self.out_channels)  # bsz, dim
-        return out
