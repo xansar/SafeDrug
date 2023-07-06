@@ -50,19 +50,24 @@ class MPNN(nn.Module):
 
         # embed: n_items, dim
         n_items, n_edges = A.shape
-        norm_factor = (tsp.sum(A, dim=0) ** -1).to_dense().reshape(n_edges, -1)
-
-        assert norm_factor.shape == (n_edges, 1)
-        X_trans = self.node_ffn(X)
-        # E计算:变换后的节点聚合,原始E变换,原始E
-        E_res = norm_factor * tsp.mm(A.T, X_trans) + self.edge_ffn(E) + E
+        if A.is_sparse:
+            norm_factor = (tsp.sum(A, dim=0) ** -1).to_dense().reshape(n_edges, -1)
+            assert norm_factor.shape == (n_edges, 1)
+            X_trans = self.node_ffn(X)
+            # E计算:变换后的节点聚合,原始E变换,原始E
+            E_res = norm_factor * tsp.mm(A.T, X_trans) + self.edge_ffn(E) + E
+        else:
+            norm_factor = (torch.sum(A, dim=0) ** -1).reshape(n_edges, -1)
+            assert norm_factor.shape == (n_edges, 1)
+            X_trans = self.node_ffn(X)
+            # E计算:变换后的节点聚合,原始E变换,原始E
+            E_res = norm_factor * torch.mm(A.T, X_trans) + self.edge_ffn(E) + E
         return E_res
 
-    def forward(self, X, E, A):
+    def forward(self, X, E, A, edge_weight):
         adj_index = A.indices()
-        hyperedge_weight = A.values()
         E_res = self.compute_edge_feat(X, E, A)
-        X_res = self.conv(X, adj_index, hyperedge_attr=E_res, hyperedge_weight=hyperedge_weight)
+        X_res = self.conv(X, adj_index, hyperedge_attr=E_res, hyperedge_weight=edge_weight)
         return X_res, E_res
 
 
@@ -134,19 +139,18 @@ class HypergraphGPSEncoderLayer(nn.Module):
         self.node_norm = nn.BatchNorm1d(embed_dim)
 
         self.edge_norm = nn.BatchNorm1d(embed_dim)
-    def forward(self, input_params, ke_bias):
+    def forward(self, X, E, A, edge_weight, ke_bias):
         """
 
         Args:
-            input_params: X, E, A
             X: 节点特征
             E: 边特征
             A: 邻接矩阵
+            edge_weight: 超边权重
         Returns:
 
         """
-        X, E, A = input_params
-        X_M_hat, E_res_hat = self.MPNN_layer(X, E, A)
+        X_M_hat, E_res_hat = self.MPNN_layer(X, E, A, edge_weight)
         E_res = self.edge_norm(E_res_hat)
         X_M = self.local_bn(self.local_dropout(X_M_hat) + X)
 
@@ -154,8 +158,7 @@ class HypergraphGPSEncoderLayer(nn.Module):
         X_T = self.global_bn(self.global_dropout(X_T_hat) + X)
 
         X_res = self.node_norm(self.node_ff_block(X_M + X_T) + X_M + X_T)
-        output = (X_res, E_res, A)
-        return output
+        return X_res, E_res
 
 
 class HypergraphGPSEncoder(nn.Module):
@@ -190,14 +193,14 @@ class HypergraphGPSEncoder(nn.Module):
         self.node_norm = nn.BatchNorm1d(embed_dim)
         self.edge_norm = nn.BatchNorm1d(embed_dim)
 
-    def forward(self, X, E, H):
+    def forward(self, X, E, H, edge_weight):
         """
 
         Args:
             X: 节点特征
             E: 边特征
             H: 邻接矩阵
-            egivecs: 超图拉普拉斯矩阵特征向量, [num_nodes, max_freqs]
+            edge_weight: 超边权重
 
         Returns:
 
@@ -208,9 +211,8 @@ class HypergraphGPSEncoder(nn.Module):
         X_lst = [X]
         E_lst = [E]
         for i in range(self.n_layers):
-            input_params = X, E, H
             layer = self.encoders[i]
-            X, E, H = layer(input_params, ke_bias)
+            X, E = layer(X, E, H, edge_weight, ke_bias)
             X_lst.append(X)
             E_lst.append(E)
         X = sum(X_lst) / (self.n_layers + 1)

@@ -34,7 +34,7 @@ np.random.seed(2048)
 # os.environ["CUDA_VISIBLE_DEVICES"] = "2"
 """
 cmd:
-CUDA_VISIBLE_DEVICES="0,1,2" torchrun --master_port 61234 --nproc_per_node=3 HGTDrugRec.py --ddp --wandb --debug
+CUDA_VISIBLE_DEVICES="0,1,2" torchrun --master_port 12345 --nproc_per_node=3 HGTDrugRec.py --ddp --wandb --lr 5e-4 --weight_decay 1e-6
 """
 
 # wandb
@@ -49,6 +49,7 @@ def init_wandb(args):
             # track hyperparameters and run metadata
             config={
                 "learning_rate": args.lr,
+                "weight_decay": args.weight_decay,
                 "architecture": args.model_name,
                 "dataset": "MIMIC-III",
                 "epochs": 50,
@@ -60,7 +61,7 @@ def init_wandb(args):
                 'n_heads': args.n_heads
             },
 
-            name=f'{args.model_name}_lr_{args.lr}_win_sz_{args.win_sz}_layers_{args.n_layers}',
+            name=f'{args.model_name}_lr_{args.lr}_w_decay_{args.weight_decay}_win_sz_{args.win_sz}_layers_{args.n_layers}',
 
             # dir
             dir='./saved'
@@ -122,23 +123,34 @@ def log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, his
             )
         )
 
-    torch.save(
-        model.state_dict(),
-        open(
-            os.path.join(
-                "saved",
-                args.model_name,
-                "Epoch_{}_TARGET_{:.2}_JA_{:.4}_DDI_{:.4}.model".format(
-                    epoch, args.target_ddi, ja, ddi_rate
-                ),
-            ),
-            "wb",
-        ),
-    )
+    # torch.save(
+    #     model.state_dict(),
+    #     open(
+    #         os.path.join(
+    #             "saved",
+    #             args.model_name,
+    #             "Epoch_{}_TARGET_{:.2}_JA_{:.4}_DDI_{:.4}.model".format(
+    #                 epoch, args.target_ddi, ja, ddi_rate
+    #             ),
+    #         ),
+    #         "wb",
+    #     ),
+    # )
 
     if epoch != 0 and best_ja < ja:
         best_epoch = epoch
         best_ja = ja
+        torch.save(
+            model.state_dict(),
+            open(
+                os.path.join(
+                    "saved",
+                    args.model_name,
+                    f"best_{args.lr}_{args.weight_decay}.model",
+                ),
+                "wb",
+            ),
+        )
 
     print("best_epoch: {}".format(best_epoch))
     return best_ja, best_epoch
@@ -246,6 +258,101 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
         med_cnt / visit_cnt,
     )
 
+def test_model(model, args, device, data_test, voc_size, epoch, padding_dict):
+    # model.load_state_dict(torch.load(open(args.resume_path, "rb")))
+    model.load_state_dict(torch.load(open(os.path.join(args.resume_path, f'best_{args.lr}_{args.weight_decay}.model'), "rb")))
+    model.to(device=device)
+    tic = time.time()
+
+    ddi_list, ja_list, prauc_list, f1_list, med_list = [], [], [], [], []
+    # ###
+    # for threshold in np.linspace(0.00, 0.20, 30):
+    #     print ('threshold = {}'.format(threshold))
+    #     ddi, ja, prauc, _, _, f1, avg_med = eval(model, data_test, voc_size, 0, threshold)
+    #     ddi_list.append(ddi)
+    #     ja_list.append(ja)
+    #     prauc_list.append(prauc)
+    #     f1_list.append(f1)
+    #     med_list.append(avg_med)
+    # total = [ddi_list, ja_list, prauc_list, f1_list, med_list]
+    # with open('ablation_ddi.pkl', 'wb') as infile:
+    #     dill.dump(total, infile)
+    # ###
+
+    result = []
+    for _ in range(10):
+        idx = np.arange(len(data_test))
+        test_sample_idx = np.random.choice(idx, round(len(data_test) * 0.8), replace=True)
+        test_sample = [data_test[i] for i in test_sample_idx]
+        test_set = MIMICDataset(test_sample)
+        test_dataloader = DataLoader(test_set, batch_size=args.eval_bsz, collate_fn=collate_fn, shuffle=False,
+                                 pin_memory=True)
+        ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
+            model, test_dataloader, voc_size, epoch, padding_dict
+        )
+        # ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
+        #     model, test_sample, voc_size, 0
+        # )
+        result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
+
+    result = np.array(result)
+    mean = result.mean(axis=0)
+    std = result.std(axis=0)
+
+    log_hyperparam_lst = [
+        'model_name',
+        'lr',
+        'weight_decay',
+        'bsz', 'win_sz',
+        'n_layers',
+        'dim',
+        'n_heads',
+        'n_protos',
+        'n_experts',
+        'dropout',
+        'multi_weight',
+        'ddi_weight',
+        'moe_weight',
+        'ssl_weight'
+    ]
+    hyper_param_str = ''
+    hyper_param_name = ''
+    for arg in vars(args):
+        if arg in log_hyperparam_lst:
+            hyper_param_name += f'{arg}\t'
+            hyper_param_str += f'{getattr(args, arg)}\t'
+        # print(format(arg, '<20'), format(str(getattr(args, arg)), '<'))
+    log_pth = os.path.join('./log', args.model_name)
+    if not os.path.exists(log_pth):
+        os.makedirs(log_pth)
+    log_fn = f'ja_{mean[1]:.4f}+-{std[1]:.4f}.txt'
+    with open(os.path.join(log_pth, log_fn), mode='w') as fw:
+        fw.write(hyper_param_name + '\n')
+        fw.write(hyper_param_str + '\n')
+    print(hyper_param_name)
+    print(hyper_param_str)
+
+    metric = ['ddi_rate', 'ja', 'avg_f1', 'prauc', 'avg_med']
+    metric_str = ''
+    metric_name_str = ''
+    for i in range(len(mean)):
+        m, s = mean[i], std[i]
+        metric_name_str += metric[i] + '\t'
+        metric_str += f'{m:.4f}±{s:.4f}\t'
+    with open(os.path.join(log_pth, log_fn), mode='a') as fw:
+        fw.write(metric_name_str + '\n')
+        fw.write(metric_str + '\n')
+    print(metric_name_str)
+    print(metric_str)
+
+    outstring = ""
+    for m, s in zip(mean, std):
+        outstring += "{:.4f} $\pm$ {:.4f} & ".format(m, s)
+
+    print(outstring)
+
+    print("test time: {}".format(time.time() - tic))
+    return
 
 def dill_load(pth, mode='rb'):
     with open(pth, mode) as fr:
@@ -269,10 +376,10 @@ def main():
     ddi_adj_path = '../data/ddi_A_final.pkl'
     ddi_mask_path = '../data/ddi_mask_H.pkl'
     molecule_path = '../data/idx2drug.pkl'
-    cache_path = "../data/graphs.pkl"
     cache_dir = '../data/cache'
     if not os.path.exists(cache_dir):
         os.makedirs(cache_dir)
+    cache_path = cache_dir
     desc_dict_path = '../data/desc_dict.pkl'
 
     ddi_adj = dill_load(ddi_adj_path, "rb")
@@ -304,7 +411,7 @@ def main():
         'med': med_voc
     }
 
-    adj_dict = construct_graphs(cache_path, data_train, nums_dict=voc_size_dict, k=args.H_k)
+    adj_dict, cluster_matrix = construct_graphs(cache_path, data_train, nums_dict=voc_size_dict, k=args.H_k, n_clusters=args.n_clusters)
     n_ehr_edges = adj_dict['diag'].shape[1]
     # # 构建word辅助超图
     # diag_side_adj = desc_hypergraph_construction(desc_dict['diag']['desc2id'], voc_size_dict['diag'])
@@ -320,13 +427,18 @@ def main():
     if args.debug:
         data_train = data_train[:100]
         data_eval = data_train[:100]
+        data_test = data_train[:100]
 
     train_set = MIMICDataset(data_train)
     eval_set = MIMICDataset(data_eval)
 
     # MPNNSet, N_fingerprint, average_projection = buildMPNN(
-    #     molecule, med_voc.idx2word, 2, device
+    #     molecule, med_voc.idx2word, 2
     # )
+
+    # 这里MPNNSet包含了很多的分子图,每个图是一个atom的邻接图
+    # average_projection是药物到分子的邻接矩阵
+    # 用的时候可以直接根据average_projection构建超边
 
     padding_dict = {
         'diag': voc_size_dict['diag'],
@@ -357,12 +469,15 @@ def main():
             adj_dict=adj_dict,
             padding_dict=padding_dict,
             voc_dict=voc_dict,
+            cluster_matrix=cluster_matrix,
             n_ehr_edges=n_ehr_edges,
             embedding_dim=args.dim,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             n_experts=args.n_experts,
             n_protos=args.n_protos,
+            n_clusters=args.n_clusters,
+            n_select=1,
             dropout=args.dropout,
             device=device,
             cache_dir=cache_dir
@@ -381,9 +496,6 @@ def main():
             print(f"Proc num:{len(pro_voc.idx2word)}")
             print(f"Med num:{len(med_voc.idx2word)}")
 
-            if not args.Test:
-                init_wandb(args)
-
             if not os.path.exists(os.path.join("saved", args.model_name)):
                 os.makedirs(os.path.join("saved", args.model_name))
             if not args.Test:
@@ -396,17 +508,21 @@ def main():
             adj_dict=adj_dict,
             padding_dict=padding_dict,
             voc_dict=voc_dict,
+            cluster_matrix=cluster_matrix,
             n_ehr_edges=n_ehr_edges,
             embedding_dim=args.dim,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             n_experts=args.n_experts,
             n_protos=args.n_protos,
+            n_clusters=args.n_clusters,
+            n_select=1,
             dropout=args.dropout,
             device=device,
             cache_dir=cache_dir
         )
         model.to(device=device)
+
         if not args.Test:
             init_wandb(args)
 
@@ -418,51 +534,54 @@ def main():
     #                              pin_memory=True)
 
     if args.Test:
-        model.load_state_dict(torch.load(open(args.resume_path, "rb")))
-        model.to(device=device)
-        tic = time.time()
+        # test_model()
+        # model.load_state_dict(torch.load(open(args.resume_path, "rb")))
+        # model.to(device=device)
+        # tic = time.time()
+        #
+        # ddi_list, ja_list, prauc_list, f1_list, med_list = [], [], [], [], []
+        # # ###
+        # # for threshold in np.linspace(0.00, 0.20, 30):
+        # #     print ('threshold = {}'.format(threshold))
+        # #     ddi, ja, prauc, _, _, f1, avg_med = eval(model, data_test, voc_size, 0, threshold)
+        # #     ddi_list.append(ddi)
+        # #     ja_list.append(ja)
+        # #     prauc_list.append(prauc)
+        # #     f1_list.append(f1)
+        # #     med_list.append(avg_med)
+        # # total = [ddi_list, ja_list, prauc_list, f1_list, med_list]
+        # # with open('ablation_ddi.pkl', 'wb') as infile:
+        # #     dill.dump(total, infile)
+        # # ###
+        # result = []
+        # for _ in range(10):
+        #     test_sample = np.random.choice(
+        #         data_test, round(len(data_test) * 0.8), replace=True
+        #     )
+        #     ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
+        #         model, test_sample, voc_size, 0
+        #     )
+        #     result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
+        #
+        # result = np.array(result)
+        # mean = result.mean(axis=0)
+        # std = result.std(axis=0)
+        #
+        # outstring = ""
+        # for m, s in zip(mean, std):
+        #     outstring += "{:.4f} $\pm$ {:.4f} & ".format(m, s)
+        #
+        # print(outstring)
+        #
+        # print("test time: {}".format(time.time() - tic))
 
-        ddi_list, ja_list, prauc_list, f1_list, med_list = [], [], [], [], []
-        # ###
-        # for threshold in np.linspace(0.00, 0.20, 30):
-        #     print ('threshold = {}'.format(threshold))
-        #     ddi, ja, prauc, _, _, f1, avg_med = eval(model, data_test, voc_size, 0, threshold)
-        #     ddi_list.append(ddi)
-        #     ja_list.append(ja)
-        #     prauc_list.append(prauc)
-        #     f1_list.append(f1)
-        #     med_list.append(avg_med)
-        # total = [ddi_list, ja_list, prauc_list, f1_list, med_list]
-        # with open('ablation_ddi.pkl', 'wb') as infile:
-        #     dill.dump(total, infile)
-        # ###
-        result = []
-        for _ in range(10):
-            test_sample = np.random.choice(
-                data_test, round(len(data_test) * 0.8), replace=True
-            )
-            ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
-                model, test_sample, voc_size, 0
-            )
-            result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
-
-        result = np.array(result)
-        mean = result.mean(axis=0)
-        std = result.std(axis=0)
-
-        outstring = ""
-        for m, s in zip(mean, std):
-            outstring += "{:.4f} $\pm$ {:.4f} & ".format(m, s)
-
-        print(outstring)
-
-        print("test time: {}".format(time.time() - tic))
+        test_model(model, args, device, data_test, voc_size, 0, padding_dict)
         return
 
     model.to(device=device)
     # print('parameters', get_n_params(model))
     # exit()
-    optimizer = Adam(list(model.parameters()), lr=args.lr, weight_decay=1e-3)
+    optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     # start iterations
     history = defaultdict(list)
@@ -470,7 +589,7 @@ def main():
 
     EPOCH = 50
     if args.debug:
-        EPOCH = 10
+        EPOCH = 3
 
     for epoch in range(EPOCH):
         if args.ddp:
@@ -533,11 +652,17 @@ def main():
                 [y_label], path="../data/ddi_A_final.pkl"
             )
 
-            alpha = 0.05
-            ssl_weight = 0.1
-            moe_weight = 1
+            multi_weight = args.multi_weight
+            loss_multi = loss_multi * multi_weight
+            ssl_weight = args.ssl_weight
+            loss_ssl = ssl_weight * loss_ssl
+            moe_weight = args.moe_weight
+            loss_moe = moe_weight * loss_moe
+
+
             if current_ddi_rate <= args.target_ddi:
-                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl + moe_weight * loss_moe
+                loss_ddi = 0 * loss_ddi
+                loss = loss_bce + loss_multi + loss_ssl + loss_moe
             else:
                 # beta = min(0, 1 + (args.target_ddi - current_ddi_rate) / args.kp)
                 # loss = (
@@ -545,9 +670,9 @@ def main():
                 #                + (1 - beta) * loss_ddi
                 #        ) + ssl_weight * loss_ssl
                 # beta = (current_ddi_rate - args.target_ddi) / args.kp
-                beta = 0.1
-                loss_ddi = beta * loss_ddi
-                loss = (1 - alpha) * loss_bce + alpha * loss_multi + ssl_weight * loss_ssl + loss_ddi + moe_weight * loss_moe
+                ddi_weight = ((current_ddi_rate - args.target_ddi) / args.kp) * args.ddi_weight
+                loss_ddi = ddi_weight * loss_ddi
+                loss = loss_bce + loss_multi + loss_ssl + loss_ddi + loss_moe
             # if current_ddi_rate <= args.target_ddi:
             #     loss = (1 - alpha) * loss_bce + alpha * loss_multi
             # else:
@@ -649,6 +774,13 @@ def main():
         #     best_ja = ja
         #
         # print("best_epoch: {}".format(best_epoch))
+    # 测试
+    if args.ddp:
+        if dist.get_rank() == 0:
+            test_model(model.module, args, device, data_test, voc_size, 0, padding_dict)
+    else:
+        test_model(model, args, device, data_test, voc_size, 0, padding_dict)
+
 
     if args.wandb:
         if args.ddp:
@@ -656,6 +788,7 @@ def main():
                 wandb.finish()
         else:
             wandb.finish()
+
     if args.ddp:
         if dist.get_rank() == 0:
             dill.dump(

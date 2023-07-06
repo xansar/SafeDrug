@@ -413,3 +413,14 @@ def multihot2idx(multihot_batch):
         target.append(np.where(visit == 1)[0])
 
     return target
+
+from sklearn import manifold
+import matplotlib.pyplot as plt
+def tsne_visual(x):
+    # t-SNE的降维与可视化
+    ts = manifold.TSNE(n_components=2, init='pca', random_state=0)
+    # 训练模型
+    y = ts.fit_transform(x)
+    plt.scatter(y[:, 0], y[:, 1], c='r', cmap=plt.cm.Spectral)
+    # 显示图像
+    plt.show()

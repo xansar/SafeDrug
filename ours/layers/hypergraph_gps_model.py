@@ -22,10 +22,12 @@ from .ehr_memory_attn import EHRMemoryAttention
 
 import faiss
 
+# from ours.util import tsne_visual
+
 
 class HGTDrugRec(nn.Module):
-    def __init__(self, voc_size_dict, adj_dict, padding_dict, voc_dict, n_ehr_edges, embedding_dim, n_heads, n_layers,
-                 n_protos, n_experts,
+    def __init__(self, voc_size_dict, adj_dict, padding_dict, voc_dict, cluster_matrix, n_ehr_edges, embedding_dim, n_heads, n_layers,
+                 n_protos, n_experts, n_select, n_clusters,
                  dropout, device, cache_dir):
         super(HGTDrugRec, self).__init__()
         self.graph_embed_cache = None
@@ -35,12 +37,25 @@ class HGTDrugRec(nn.Module):
         self.num_dict = voc_size_dict
         self.n_ehr_edges = n_ehr_edges
         self.n_protos = n_protos
+        self.n_clusters = n_clusters
+
         self.device = device
 
         self.tensor_ddi_adj = adj_dict['ddi_adj'].to(device)  # 普通图
         self.adj_dict = {k: v.to(device) for k, v in adj_dict.items()}
+        # 为每个超边赋予一个可学习的权重
+        self.edge_weight_dict = nn.ParameterDict()
+        for n in self.name_lst:
+            adj = self.adj_dict[n]
+            n_edge = adj.shape[1]
+            weight = torch.rand(n_edge)
+            weight = torch.nn.Parameter(weight, requires_grad=True).to(device)
+            self.edge_weight_dict[n] = weight
 
         self.padding_dict = padding_dict
+
+        self.cluster_matrix = cluster_matrix
+        self.n_select = n_select
 
         self.n_heads = n_heads
 
@@ -89,6 +104,9 @@ class HGTDrugRec(nn.Module):
             }
         )
 
+        self.ssl_temp = 0.1
+        self.ssl_reg = 1e-3
+
         self.node2edge_agg = nn.ModuleDict(
             {
                 n: Node2EdgeAggregator(embedding_dim, n_heads, dropout)
@@ -132,8 +150,17 @@ class HGTDrugRec(nn.Module):
             dropout=dropout
         )
 
+        self.med_context_attn = nn.MultiheadAttention(
+            # embed_dim=embedding_dim * 3,
+            embed_dim=embedding_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
         self.context_attn = nn.MultiheadAttention(
-            embed_dim=embedding_dim * 3,
+            # embed_dim=embedding_dim * 3,
+            embed_dim=embedding_dim,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True,
@@ -147,11 +174,11 @@ class HGTDrugRec(nn.Module):
         #     nn.LeakyReLU(),
         #     nn.LayerNorm(embedding_dim),
         # )
-        self.output_mlp = nn.Sequential(
-            nn.Linear(3 * embedding_dim, embedding_dim),
-            nn.LeakyReLU(),
-            nn.BatchNorm1d(embedding_dim),  # 这里不能用batch,因为有空的visit
-        )
+        # self.output_mlp = nn.Sequential(
+        #     nn.Linear(3 * embedding_dim, embedding_dim),
+        #     nn.LeakyReLU(),
+        #     nn.BatchNorm1d(embedding_dim),  # 这里不能用batch,因为有空的visit
+        # )
 
         self.output_norm = nn.BatchNorm1d(self.voc_size_dict['med'])
 
@@ -213,14 +240,34 @@ class HGTDrugRec(nn.Module):
 
         # embed: n_items, dim
         n_items, n_edges = adj.shape
-        norm_factor = (tsp.sum(adj, dim=0) ** -1).to_dense().reshape(n_edges, -1)
+        if adj.is_sparse:
+            norm_factor = (tsp.sum(adj, dim=0) ** -1).to_dense().reshape(n_edges, -1)
+            assert norm_factor.shape == (n_edges, 1)
+            E = norm_factor * tsp.mm(adj.T, embed)
+        else:
+            norm_factor = (torch.sum(adj, dim=0) ** -1).reshape(n_edges, -1)
+            assert norm_factor.shape == (n_edges, 1)
+            E = norm_factor * torch.mm(adj.T, embed)
 
-        assert norm_factor.shape == (n_edges, 1)
-        E = norm_factor * tsp.mm(adj.T, embed)
         return E
 
+    def hyperedge_select(self, adj, cluster_matrix, edge_weight, k=1):
+        mask = (cluster_matrix != 0).float()
+        idx = torch.multinomial(mask, k, replacement=False).flatten()
+        idx = cluster_matrix.gather(1, idx.reshape(-1, 1))
+        assert idx.shape == (cluster_matrix.shape[0], 1)
+        idx = idx.reshape(-1)
+        selected_weight = edge_weight[idx]
+        selected_adj = adj.to_dense()[:, idx].to_sparse_coo().coalesce()
+        if adj.shape[1] > self.n_ehr_edges:
+            side_edge = adj.to_dense()[:, self.n_ehr_edges + 1:].to_sparse_coo().coalesce()
+            side_edge_weight = edge_weight[self.n_ehr_edges + 1:]
+            selected_adj = torch.cat([selected_adj, side_edge], dim=1).coalesce()
+            selected_weight = torch.cat([selected_weight, side_edge_weight], dim=0)
+        return selected_adj, selected_weight
+
     # 先写graph encode的部分
-    def graph_encode(self, x, adj):
+    def graph_encode(self, x, adj, edge_weight):
         """
         进行超图编码
         Args:
@@ -233,20 +280,43 @@ class HGTDrugRec(nn.Module):
         X = {}
         E = {}
         for n in self.name_lst:
-            edges = self.get_hyperedge_representation(x[n], adj[n])
-            X[n], E[n] = self.graph_encoder[n](x[n], edges, adj[n])
+            # 这里需要随机从簇里抽出一部分超边
+            if self.training:
+                # selected_adj, selected_edge_weight = self.hyperedge_select(adj[n], self.cluster_matrix[n], edge_weight[n], self.n_select)
+                selected_adj, selected_edge_weight = adj[n], edge_weight[n]
+            else:
+                selected_adj, selected_edge_weight = adj[n], edge_weight[n]
+
+            edges = self.get_hyperedge_representation(x[n], selected_adj)
+            X[n], E[n] = self.graph_encoder[n](x[n], edges, selected_adj, selected_edge_weight)
             # adj_index = adj[n].indices()
             # hyperedge_attr = self.get_hyperedge_representation(x[n], adj[n])
             # x[n] = self.layernorm_1[n](x[n] + self.graph_encoder[n](x[n], adj_index, hyperedge_attr=hyperedge_attr))
             # x[n] = self.layernorm_2[n](x[n] + self.ffn[n](x[n]))
         # 将三个图上的超边拼接起来,这里要注意,因为有辅助超边信息,很可能没办法直接拼起来,需要将前面ehr的部分取出来
         # 假设有一个变量self.n_ehr_edges,记录了所有的visit数量
-        idx = self.n_ehr_edges
+        if self.training:
+            # ehr_size = min(self.n_ehr_edges, self.n_clusters)
+            ehr_size = self.n_ehr_edges
+        else:
+            ehr_size = self.n_ehr_edges
         # idx = 265
-        E_ehr = torch.cat([E['diag'][:idx], E['proc'][:idx], E['med'][:idx]], dim=-1)
+        # E_ehr = torch.cat([E['diag'][:ehr_size], E['proc'][:ehr_size], E['med'][:ehr_size]], dim=-1)
+        E_ehr = {
+            'dp': E['diag'][:ehr_size] + E['proc'][:ehr_size],
+            'm': E['med'][:ehr_size]
+        }
         # 这里执行聚类
-        E_mem, mem2ehr = self.edges_cluster(E_ehr)
-        assert E_mem.shape == (self.n_protos, self.embedding_dim * 3)
+        if self.training:
+            E_mem = E_ehr
+            # E_mem, mem2ehr = self.edges_cluster(E_ehr)
+        else:
+            E_mem = E_ehr
+            # E_mem, mem2ehr = self.edges_cluster(E_ehr)
+
+        # cluster_ssl = self.cluster_SSL(E_ehr, E_mem, mem2ehr)
+        # cluster_ssl = self.ssl_reg * cluster_ssl
+        # assert E_mem.shape == (self.n_protos, self.embedding_dim * 3)
         return X, E, E_mem
 
     def node2edge(self, entity_seq_embed):
@@ -269,13 +339,30 @@ class HGTDrugRec(nn.Module):
         return visit_seq_embed
 
     def DPM_SSL(self, E):
-        D, P, M = E['diag'][:self.n_ehr_edges], E['proc'][:self.n_ehr_edges], E['med'][:self.n_ehr_edges]
+        if self.training:
+            # ehr_size = min(self.n_ehr_edges, self.n_clusters)
+            ehr_size = self.n_ehr_edges
+        else:
+            ehr_size = self.n_ehr_edges
+        D, P, M = E['diag'][:ehr_size], E['proc'][:ehr_size], E['med'][:ehr_size]
         assert D.shape == P.shape == M.shape
         dp_ssl_loss = self.info_nce_loss(D, P)
         dm_ssl_loss = self.info_nce_loss(D, M)
         pm_ssl_loss = self.info_nce_loss(P, M)
         loss = dp_ssl_loss + dm_ssl_loss + pm_ssl_loss
         return loss.mean()
+
+    # def cluster_SSL(self, edges, centroids, edge2cluster):
+    #     norm_edges = F.normalize(edges)
+    #     edge2centroids = centroids[edge2cluster]
+    #
+    #     pos_score = torch.mul(norm_edges, edge2centroids).sum(dim=1)
+    #     pos_score = torch.exp(pos_score / self.ssl_temp)
+    #     ttl_score = torch.matmul(norm_edges, centroids.transpose(0, 1))
+    #     ttl_score = torch.exp(ttl_score / self.ssl_temp).sum(dim=1)
+    #
+    #     proto_nce_loss = -torch.log(pos_score / ttl_score).sum()
+    #     return proto_nce_loss
 
     def edges_cluster(self, x):
         """Run K-means algorithm to get k clusters of the input tensor x
@@ -300,7 +387,7 @@ class HGTDrugRec(nn.Module):
         # 首先是embedding层
         raw_embedding = self.get_embedding()  # dict
         # 最开始是超图编码层
-        X_hat, E_hat, E_mem = self.graph_encode(raw_embedding, self.adj_dict)
+        X_hat, E_hat, E_mem = self.graph_encode(raw_embedding, self.adj_dict, self.edge_weight_dict)
         for n in self.name_lst:
             # 这里需要注意,因为records中含有pad,需要给embedding补一行
             padding_row = self.embedding[n](
@@ -325,7 +412,7 @@ class HGTDrugRec(nn.Module):
             raw_embedding = self.get_embedding()  # dict
             # 最开始是超图编码层
             self.graph_embed_cache = None
-            X_hat, E_hat, E_mem = self.graph_encode(raw_embedding, self.adj_dict)
+            X_hat, E_hat, E_mem = self.graph_encode(raw_embedding, self.adj_dict, self.edge_weight_dict)
             for n in self.name_lst:
                 # 这里需要注意,因为records中含有pad,需要给embedding补一行
                 padding_row = self.embedding[n](
@@ -336,7 +423,8 @@ class HGTDrugRec(nn.Module):
 
         # 自监督损失
         ## 三个领域相互做ssl
-        ssl_loss = self.DPM_SSL(E_hat)
+        dpm_ssl = self.DPM_SSL(E_hat)
+        ssl_loss = dpm_ssl
 
         # 解析序列数据
         entity_seq_embed = {}  # (bsz, max_vist, max_size, dim)
@@ -353,13 +441,28 @@ class HGTDrugRec(nn.Module):
         batch_size, max_visit, dim = med_history.shape
         pad_head_med_history = torch.zeros(batch_size, 1, dim, dtype=med_history.dtype, device=med_history.device)
         med_history = torch.cat([pad_head_med_history, med_history], dim=1)[:, :-1, :]  # 这里就shift过了
+        med_history = med_history.reshape(batch_size * max_visit, dim)
+        med_history = med_history[true_visit_idx]   # 只保留非空的visit
+
+        # # 这里将diag和proc还有历史用药拼起来
+        # visit_rep = torch.cat([visit_seq_embed['diag'], visit_seq_embed['proc'], med_history], dim=-1)
+        # assert visit_rep.shape == (batch_size, max_visit, dim * 3)
+        #
+        # # 用多头注意力,当前为q,图上的超边为k和v
+        # # 这里感觉用dp作为q,历史dp作为k,历史作为v比较好
+        # visit_rep = visit_rep.reshape(batch_size * max_visit, dim * 3)
+        # visit_rep = visit_rep[true_visit_idx]   # 只保留非空的visit
+        # visit_rep_mem = self.visit_mem_attn(
+        #     visit_rep, E_mem
+        # )
 
         # 这里将diag和proc还有历史用药拼起来
-        visit_rep = torch.cat([visit_seq_embed['diag'], visit_seq_embed['proc'], med_history], dim=-1)
-        assert visit_rep.shape == (batch_size, max_visit, dim * 3)
+        visit_rep = visit_seq_embed['diag'] + visit_seq_embed['proc']
+        assert visit_rep.shape == (batch_size, max_visit, dim)
 
         # 用多头注意力,当前为q,图上的超边为k和v
-        visit_rep = visit_rep.reshape(batch_size * max_visit, dim * 3)
+        # 这里感觉用dp作为q,历史dp作为k,历史作为v比较好
+        visit_rep = visit_rep.reshape(batch_size * max_visit, dim)
         visit_rep = visit_rep[true_visit_idx]   # 只保留非空的visit
         visit_rep_mem = self.visit_mem_attn(
             visit_rep, E_mem
@@ -378,11 +481,21 @@ class HGTDrugRec(nn.Module):
             # 用来遮挡key中的padding,和key一样的shape,这里应该需要把补足用的visitmask上,bsz_max_visit
             attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
         )
-        context_rep = self.output_mlp(context_rep)
+
+        med_context_rep, med_context_attn = self.med_context_attn(
+            query=med_history, key=med_history, value=med_history, need_weights=True,
+            # key_padding_mask=masks['key_padding_mask'],
+            # 用来遮挡key中的padding,和key一样的shape,这里应该需要把补足用的visitmask上,bsz_max_visit
+            attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
+        )
+
+        # context_rep = self.output_mlp(context_rep)
         # 这里直接接MoE输出预测
         med_embedding = X_hat['med']
         # 这里要注意,最后一列是padding,需要去掉
-        dot_output = torch.matmul(context_rep, med_embedding.T)[:, :-1]
+        dp_dot_output = torch.matmul(context_rep, med_embedding.T)[:, :-1]
+        med_dot_output = torch.matmul(med_context_rep, med_embedding.T)[:, :-1]
+        dot_output = dp_dot_output + med_dot_output
         # dot_output = dot_output.reshape(batch_size * max_visit, -1)
         dot_output = self.output_norm(dot_output)
         output, moe_loss = self.moe_preditor(dot_output)

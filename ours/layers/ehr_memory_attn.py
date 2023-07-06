@@ -16,14 +16,17 @@ class EHRMemoryAttention(nn.Module):
     def __init__(self, embedding_dim, n_heads, dropout):
         super(EHRMemoryAttention, self).__init__()
         self.visit_mem_attn = nn.MultiheadAttention(
-            embed_dim=embedding_dim * 3,
+            # embed_dim=embedding_dim * 3,
+            embed_dim=embedding_dim,
             num_heads=n_heads,
             dropout=dropout,
             batch_first=True,
         )
         # Implementation of Feedforward model
-        d_model = embedding_dim * 3
-        dim_feedforward = embedding_dim * 3
+        # d_model = embedding_dim * 3
+        # dim_feedforward = embedding_dim * 3
+        d_model = embedding_dim
+        dim_feedforward = embedding_dim
         self.linear1 = nn.Linear(d_model, dim_feedforward)
         self.dropout = nn.Dropout(dropout)
         self.linear2 = nn.Linear(dim_feedforward, d_model)
@@ -46,8 +49,8 @@ class EHRMemoryAttention(nn.Module):
 
         """
         x = visit_rep
-        k = E_mem
-        v = E_mem
+        k = E_mem['dp']
+        v = E_mem['m']
         x = self.norm1(x + self._att_block(x, k, v))
         x = self.norm2(x + self._ff_block(x))
 
