@@ -87,6 +87,16 @@ def factorize_and_recover(H, niter=10, k=10):
     return H_filter
 
 def construct_graphs_v2(cache_pth, data_train, nums_dict):
+    """
+    问题: 太稠密了
+    Args:
+        cache_pth:
+        data_train:
+        nums_dict:
+
+    Returns:
+
+    """
     name_lst = ['diag', 'proc', 'med']
 
     graphs_pth = os.path.join(cache_pth, f'cocur_graphs.pkl')
@@ -127,7 +137,7 @@ def construct_graphs_v2(cache_pth, data_train, nums_dict):
                         Med_Med_matrix[m, m] += 1
 
         def generate_H(matrix):
-            matrix /= torch.mean(matrix, 1, keepdim=True)
+            matrix /= torch.sum(matrix, 1, keepdim=True)
             matrix = matrix.to_sparse_coo()
             return matrix
 
@@ -151,6 +161,56 @@ def construct_graphs_v2(cache_pth, data_train, nums_dict):
     H_dict = {k: v.coalesce() for k, v in H_dict.items()}
     # cluster_dict = {k: v.long() for k, v in cluster_dict.items()}
     return H_dict
+
+
+def construct_graphs_v3(cache_pth, data_train, nums_dict):
+    name_lst = ['diag', 'proc', 'med']
+
+    graphs_pth = os.path.join(cache_pth, f'fusion_graph.pkl')
+    # if os.path.exists(graphs_pth):
+    if False:
+        graphs = torch.load(graphs_pth)
+        H_dict = graphs['H_dict']
+        cluster_dict = graphs['cluster_dict']
+    else:
+        # 这里要注意，因为模型的embedding有pad token end token在，这里要注意n_diag的实际值
+        # 构建诊断和手术联合超图
+
+        coo = []
+        visit_num = 0
+        for u, visits in enumerate(data_train):
+            for t, v in enumerate(visits):
+                # 这里v是[诊断，手术，药物]
+                diag, proc, med = v
+                # 将三条边拼接在一起,顺序是diag,proc,med,所以proc和med的idx分别要做平移
+                diag = diag
+                proc = [p + nums_dict['diag'] for p in proc]
+                med = [m + nums_dict['diag'] + nums_dict['med'] for m in med]
+                hyper_edge = diag + proc + med
+
+                for idx, item in enumerate(hyper_edge):
+                    coo.append([item, visit_num])
+
+                visit_num += 1
+
+        # 将稀疏邻接矩阵转换成numpy array
+        # 超图
+        coo = np.array(coo, dtype=np.int64).T
+        H_i = torch.from_numpy(coo)
+        H_v = torch.ones(H_i.shape[1])
+        H = torch.sparse_coo_tensor(
+            indices=H_i,
+            values=H_v,
+            size=(nums_dict['diag'] + nums_dict['proc'] + nums_dict['med'], visit_num)
+        ).coalesce().float()
+
+        # torch.save(
+        #     {
+        #         'H_dict': H_dict,
+        #     },
+        #     graphs_pth
+        # )
+    return H
 
 def construct_graphs(cache_pth, data_train, nums_dict, k=5, n_clusters=1000):
     name_lst = ['diag', 'proc', 'med']
