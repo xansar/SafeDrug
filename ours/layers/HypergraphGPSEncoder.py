@@ -236,6 +236,8 @@ class Node2EdgeAggregator(nn.Module):
             dropout=dropout,
             batch_first=True,
         )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
         self._ff_block = FeedForwardLayer(embed_dim, dropout)
     def forward(self, x):
         """
@@ -249,8 +251,8 @@ class Node2EdgeAggregator(nn.Module):
         # 首先使用平均计算超边表示,然后将节点表示和超边表示拼接起来计算注意力
         bsz, max_size, dim = x.shape
         hyperedge_attr = x.mean(1, keepdim=True)   # bsz, 1, dim
-        attn_visit = self._sa_block(hyperedge_attr, x, x)
-        out = self._ff_block(attn_visit)
+        hyperedge_attr = self.norm1(self._sa_block(hyperedge_attr, x, x) + hyperedge_attr)
+        out = self.norm2(self._ff_block(hyperedge_attr) + hyperedge_attr)
         return out
 
     def _sa_block(self, q, k, v):

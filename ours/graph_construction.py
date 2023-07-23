@@ -86,12 +86,78 @@ def factorize_and_recover(H, niter=10, k=10):
     H_filter = torch.sparse_coo_tensor(indices, values, size=H.shape).coalesce()
     return H_filter
 
+def construct_graphs_v2(cache_pth, data_train, nums_dict):
+    name_lst = ['diag', 'proc', 'med']
+
+    graphs_pth = os.path.join(cache_pth, f'cocur_graphs.pkl')
+    # if os.path.exists(graphs_pth):
+    if False:
+        graphs = torch.load(graphs_pth)
+        H_dict = graphs['H_dict']
+        cluster_dict = graphs['cluster_dict']
+    else:
+        # 这里要注意，因为模型的embedding有pad token end token在，这里要注意n_diag的实际值
+        # 构建诊断和手术联合超图
+
+        coo_dict = {
+            name: [] for name in name_lst
+        }
+        visit_num = 0
+        Med_Diag_matrix = torch.zeros(nums_dict['med'], nums_dict['diag'])
+        Med_Proc_matrix = torch.zeros(nums_dict['med'], nums_dict['proc'])
+        Med_Med_matrix = torch.zeros(nums_dict['med'], nums_dict['med'])
+        for u, visits in enumerate(data_train):
+            for t, v in enumerate(visits):
+                # 这里v是[诊断，手术，药物]
+                # 分解构建md,mp,mm共现矩阵
+                set_dict = {
+                    name_lst[i]: v[i]
+                    for i in range(3)
+                }
+                # 填充共现矩阵
+                for m in set_dict['med']:
+                    ## med diag
+                    for d in set_dict['diag']:
+                        Med_Diag_matrix[m, d] += 1
+                    ## med proc
+                    for p in set_dict['proc']:
+                        Med_Proc_matrix[m, p] += 1
+                    ## med med
+                    for m in set_dict['med']:
+                        Med_Med_matrix[m, m] += 1
+
+        def generate_H(matrix):
+            matrix /= torch.mean(matrix, 1, keepdim=True)
+            matrix = matrix.to_sparse_coo()
+            return matrix
+
+        Med_Diag_matrix = generate_H(Med_Diag_matrix)
+        Med_Proc_matrix = generate_H(Med_Proc_matrix)
+        Med_Med_matrix = generate_H(Med_Med_matrix)
+
+        H_dict = {
+            'md': Med_Diag_matrix,
+            'mp': Med_Proc_matrix,
+            'mm': Med_Med_matrix
+        }
+
+        torch.save(
+            {
+                'H_dict': H_dict,
+            },
+            graphs_pth
+        )
+
+    H_dict = {k: v.coalesce() for k, v in H_dict.items()}
+    # cluster_dict = {k: v.long() for k, v in cluster_dict.items()}
+    return H_dict
 
 def construct_graphs(cache_pth, data_train, nums_dict, k=5, n_clusters=1000):
     name_lst = ['diag', 'proc', 'med']
 
     graphs_pth = os.path.join(cache_pth, f'{n_clusters}_graphs.pkl')
-    if os.path.exists(graphs_pth):
+    # if os.path.exists(graphs_pth):
+    if False:
         graphs = torch.load(graphs_pth)
         H_dict = graphs['H_dict']
         cluster_dict = graphs['cluster_dict']
@@ -106,12 +172,12 @@ def construct_graphs(cache_pth, data_train, nums_dict, k=5, n_clusters=1000):
         for u, visits in enumerate(data_train):
             for t, v in enumerate(visits):
                 # 这里v是[诊断，手术，药物]
-                # 1961, 1433, 134
 
                 set_dict = {
                     name_lst[i]: v[i]
                     for i in range(3)
                 }
+
                 hyper_edge = {
                     # name: sorted(set_dict[name]) for name in name_lst
                     name: set_dict[name] for name in name_lst
@@ -151,10 +217,10 @@ def construct_graphs(cache_pth, data_train, nums_dict, k=5, n_clusters=1000):
                 size=(nums_dict[n], int(coo_dict[n].max(1)[1]) + 1)
             ).coalesce()
             # H = factorize_and_recover(H, k=k)
-            H = tf_idf_compute(H, filter=False)
+            # H = tf_idf_compute(H, filter=False)
             # 考虑对超图进行过滤,缩小边的数量
-            labels = cluster_hyperedges(H, n_clusters=n_clusters, dim=64)
-            cluster_dict[n] = torch.from_numpy(labels)
+            # labels = cluster_hyperedges(H, n_clusters=n_clusters, dim=64)
+            # cluster_dict[n] = torch.from_numpy(labels)
             H_dict[n] = H.float()
             # H = cluster_hyperedges(H, 256, 64)
 
@@ -169,7 +235,7 @@ def construct_graphs(cache_pth, data_train, nums_dict, k=5, n_clusters=1000):
         )
 
     H_dict = {k: v.coalesce() for k, v in H_dict.items()}
-    cluster_dict = {k: v.long() for k, v in cluster_dict.items()}
+    # cluster_dict = {k: v.long() for k, v in cluster_dict.items()}
     return H_dict, cluster_dict
 
 
@@ -222,6 +288,13 @@ def tsne(x, dim):
     # 训练模型
     y = ts.fit_transform(x)
     return y
+
+def visualization(X, title=None):
+    X = X.detach().cpu().numpy()
+    visual_X = tsne(X, 2)
+    plt.scatter(visual_X[:, 0], visual_X[:, 1], marker='o', s=4)
+    plt.title(title)
+    plt.show()
 
 
 def graph2hypergraph(adj):

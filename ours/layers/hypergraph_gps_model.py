@@ -188,7 +188,21 @@ class HGTDrugRec(nn.Module):
             n_experts=n_experts
         )
 
+        self.med_moe_preditor = MoEPredictor(
+            embed_dim=embedding_dim,
+            output_size=voc_size_dict['med'],
+            n_experts=n_experts
+        )
+
         self.pred_norm = nn.BatchNorm1d(self.voc_size_dict['med'])
+        self.med_pred_norm = nn.BatchNorm1d(self.voc_size_dict['med'])
+
+        self.gate_control = nn.Sequential(
+            nn.Linear(5 * self.voc_size_dict['med'], self.voc_size_dict['med']),
+            nn.ReLU(),
+            nn.BatchNorm1d(self.voc_size_dict['med']),
+            nn.Sigmoid()
+        )
         # self.d_p_seq_attn = nn.MultiheadAttention(
         #     embed_dim=embedding_dim,
         #     num_heads=n_heads,
@@ -456,27 +470,22 @@ class HGTDrugRec(nn.Module):
         #     visit_rep, E_mem
         # )
 
+        # 先上下文再记忆
         # 这里将diag和proc还有历史用药拼起来
         visit_rep = visit_seq_embed['diag'] + visit_seq_embed['proc']
         assert visit_rep.shape == (batch_size, max_visit, dim)
-
-        # 用多头注意力,当前为q,图上的超边为k和v
-        # 这里感觉用dp作为q,历史dp作为k,历史作为v比较好
         visit_rep = visit_rep.reshape(batch_size * max_visit, dim)
         visit_rep = visit_rep[true_visit_idx]   # 只保留非空的visit
-        visit_rep_mem = self.visit_mem_attn(
-            visit_rep, E_mem
-        )
 
         # 计算包含上下文信息的表示
         # attn_mask = masks['attn_mask'].repeat(self.n_heads, 1, 1)
         attn_mask = masks['attn_mask']
         attn_mask = attn_mask[true_visit_idx][:, true_visit_idx]
-        assert attn_mask.shape == (visit_rep_mem.shape[0], visit_rep_mem.shape[0])
+        assert attn_mask.shape == (visit_rep.shape[0], visit_rep.shape[0])
         # visit_rep_mem = visit_rep_mem.reshape(batch_size, max_visit, dim * 3)
 
         context_rep, context_attn = self.context_attn(
-            query=visit_rep_mem, key=visit_rep_mem, value=visit_rep_mem, need_weights=True,
+            query=visit_rep, key=visit_rep, value=visit_rep, need_weights=True,
             # key_padding_mask=masks['key_padding_mask'],
             # 用来遮挡key中的padding,和key一样的shape,这里应该需要把补足用的visitmask上,bsz_max_visit
             attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
@@ -489,17 +498,42 @@ class HGTDrugRec(nn.Module):
             attn_mask=attn_mask,  # 加上会输出nan,因为有些地方的是补0的,整行都是True,相当于不计算
         )
 
+        # 用多头注意力,当前为q,图上的超边为k和v
+        # 这里感觉用dp作为q,历史dp作为k,历史作为v比较好
+
+        visit_rep_mem = self.visit_mem_attn(
+            context_rep, E_mem
+        )
+
         # context_rep = self.output_mlp(context_rep)
         # 这里直接接MoE输出预测
         med_embedding = X_hat['med']
         # 这里要注意,最后一列是padding,需要去掉
-        dp_dot_output = torch.matmul(context_rep, med_embedding.T)[:, :-1]
-        med_dot_output = torch.matmul(med_context_rep, med_embedding.T)[:, :-1]
-        dot_output = dp_dot_output + med_dot_output
+        dp_dot_output = torch.matmul(visit_rep_mem, med_embedding.T)[:, :-1]
         # dot_output = dot_output.reshape(batch_size * max_visit, -1)
-        dot_output = self.output_norm(dot_output)
-        output, moe_loss = self.moe_preditor(dot_output)
-        output = self.pred_norm(output)
+        dp_dot_output = self.output_norm(dp_dot_output)
+        dp_output, dp_moe_loss = self.moe_preditor(dp_dot_output)
+        dp_output = self.pred_norm(dp_output)
+
+        # 纯药物output
+        med_output, med_moe_loss = self.med_moe_preditor(med_context_rep)
+        med_output = self.med_pred_norm(med_output)
+        # 门控,输入用拼接,加,减,乘,一共5 * med_size
+        # lin+relu+norm+sig
+        # 输出是med_size
+        gate_input = torch.cat([
+            dp_output,
+            med_output,
+            dp_output + med_output,
+            dp_output - med_output,
+            dp_output * med_output
+        ], dim=-1)
+        gate = self.gate_control(gate_input)
+
+        # 整合
+        output = gate * dp_output + (1 - gate) * med_output
+        moe_loss = dp_moe_loss + med_moe_loss
+
         # output = dot_output
         # moe_loss = dot_output.mean()
 

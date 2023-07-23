@@ -20,12 +20,18 @@ import wandb
 import torch.distributed as dist
 
 from layers import HGTDrugRec
+from layers import HGTDecoder
 from graph_construction import construct_graphs, graph2hypergraph, desc_hypergraph_construction
 from util import llprint, multi_label_metric, ddi_rate_score, buildMPNN, replace_with_padding_woken, multihot2idx
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataloader import collate_fn, MIMICDataset
 from config import parse_args
+
+from build_pretrainer import HGTPretrainer
+from graph_construction import visualization
+
+from multi_category_loss import multilabel_categorical_crossentropy
 
 torch.manual_seed(1203)
 np.random.seed(2048)
@@ -152,7 +158,7 @@ def log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, his
                 os.path.join(
                     "saved",
                     args.model_name,
-                    f"best_{args.lr}_{args.weight_decay}.model",
+                    f"best_{args.name}_{args.dropout}_{args.lr}_{args.weight_decay}.model",
                 ),
                 "wb",
             ),
@@ -161,21 +167,69 @@ def log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, his
     print("best_epoch: {}".format(best_epoch))
     return best_epoch, best_ja, ja
 
+def compute_metric(targets, result, bsz, max_visit, masks):
+    padding_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit).detach().cpu().numpy()
+    true_visit_idx = np.where(padding_mask == True)[0]
+    y_gt = targets['loss_bce_target'].detach().cpu().numpy()
+
+    y_pred_prob = F.sigmoid(result).detach().cpu().numpy()
+
+    y_pred = y_pred_prob.copy()
+    y_pred[y_pred >= 0.5] = 1
+    y_pred[y_pred < 0.5] = 0
+
+    y_pred_label = multihot2idx(y_pred)
+
+    y_gt = y_gt.reshape(bsz * max_visit, -1)[true_visit_idx]
+    y_pred_prob = y_pred_prob
+    # y_pred_label = [y_pred_label[n] for n in true_visit_idx.tolist()]
+    # for adm_idx, adm in enumerate(input):
+    #     # adm: diag, pro, med
+    #     target_output, _ = model(input[: adm_idx + 1])
+    #
+    #     y_gt_tmp = np.zeros(voc_size[2])
+    #     y_gt_tmp[adm[2]] = 1
+    #     y_gt.append(y_gt_tmp)
+    #
+    #     # prediction prod
+    #     target_output = F.sigmoid(target_output).detach().cpu().numpy()[0]
+    #     y_pred_prob.append(target_output)
+    #
+    #     # prediction med set
+    #     y_pred_tmp = target_output.copy()
+    #     y_pred_tmp[y_pred_tmp >= 0.5] = 1
+    #     y_pred_tmp[y_pred_tmp < 0.5] = 0
+    #     y_pred.append(y_pred_tmp)
+    #
+    #     # prediction label
+    #     y_pred_label_tmp = np.where(y_pred_tmp == 1)[0]
+    #     y_pred_label.append(sorted(y_pred_label_tmp))
+    #     visit_cnt += 1
+    #     med_cnt += len(y_pred_label_tmp)
+
+    # smm_record.append(y_pred_label)
+    adm_ja, adm_prauc, adm_avg_p, adm_avg_r, adm_avg_f1 = multi_label_metric(
+        np.array(y_gt), np.array(y_pred), np.array(y_pred_prob)
+    )
+    med_cnt = y_pred.sum()
+    visit_cnt = len(y_pred_label)
+    return adm_ja, adm_prauc, adm_avg_p, adm_avg_r, adm_avg_f1, med_cnt / visit_cnt
 
 # evaluate
-def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
+def eval(model, eval_data_loader, voc_size, epoch, padding_dict, threshold=0.5):
     model.eval()
 
     # smm_record = []
     ja, prauc, avg_p, avg_r, avg_f1, avg_ddi = [[] for _ in range(6)]
     med_cnt, visit_cnt = 0, 0
 
-    model.cache_in_eval()
+    # model.cache_in_eval()
 
-    for step, (records, masks, targets) in enumerate(eval_data_loader):
+    for step, (records, masks, targets, visit2edge) in enumerate(eval_data_loader):
         records = {k: replace_with_padding_woken(v, -1, padding_dict[k]).to(model.device) for k, v in records.items()}
         masks = {k: v.to(model.device) for k, v in masks.items()}
         targets = {k: v.to(model.device) for k, v in targets.items()}
+        visit2edge = visit2edge.to(model.device)
 
         # y_gt, y_pred, y_pred_prob, y_pred_label = [], [], [], []
 
@@ -184,15 +238,17 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
         padding_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit).detach().cpu().numpy()
         true_visit_idx = np.where(padding_mask == True)[0]
 
-        target_output, _ = model(records, masks, torch.from_numpy(true_visit_idx).to(model.device))
+        target_output, _ = model(records, masks, torch.from_numpy(padding_mask == True).to(model.device), visit2edge)
 
         y_gt = targets['loss_bce_target'].detach().cpu().numpy()
 
         y_pred_prob = F.sigmoid(target_output).detach().cpu().numpy()
+        # threshold = 0
+        # y_pred_prob = target_output.detach().cpu().numpy()
 
         y_pred = y_pred_prob.copy()
-        y_pred[y_pred >= 0.5] = 1
-        y_pred[y_pred < 0.5] = 0
+        y_pred[y_pred >= threshold] = 1
+        y_pred[y_pred < threshold] = 0
 
         y_pred_label = multihot2idx(y_pred)
 
@@ -264,11 +320,20 @@ def eval(model, eval_data_loader, voc_size, epoch, padding_dict):
         med_cnt / visit_cnt,
     )
 
+def get_n_params(model):
+    pp=0
+    for p in list(model.parameters()):
+        nn=1
+        for s in list(p.size()):
+            nn = nn*s
+        pp += nn
+    return pp
 
-def test_model(model, args, device, data_test, voc_size, epoch, padding_dict):
+def test_model(model, args, device, data_test, voc_size, best_epoch, padding_dict):
     # model.load_state_dict(torch.load(open(args.resume_path, "rb")))
     model.load_state_dict(
-        torch.load(open(os.path.join(args.resume_path, f'best_{args.lr}_{args.weight_decay}.model'), "rb")))
+        torch.load(open(os.path.join(args.resume_path, f'best_{args.name}_{args.dropout}_{args.lr}_{args.weight_decay}.model'), "rb")))
+        # torch.load(open(os.path.join(args.resume_path, f'best_35_0.3_0.001_1e-05.model'), "rb")))
     model.to(device=device)
     tic = time.time()
 
@@ -296,7 +361,7 @@ def test_model(model, args, device, data_test, voc_size, epoch, padding_dict):
         test_dataloader = DataLoader(test_set, batch_size=args.eval_bsz, collate_fn=collate_fn, shuffle=False,
                                      pin_memory=True)
         ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
-            model, test_dataloader, voc_size, epoch, padding_dict
+            model, test_dataloader, voc_size, best_epoch, padding_dict
         )
         # ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
         #     model, test_sample, voc_size, 0
@@ -317,6 +382,7 @@ def test_model(model, args, device, data_test, voc_size, epoch, padding_dict):
         'n_heads',
         'n_protos',
         'n_experts',
+        'experts_k',
         'dropout',
         'multi_weight',
         'ddi_weight',
@@ -366,6 +432,12 @@ def dill_load(pth, mode='rb'):
     with open(pth, mode) as fr:
         file = dill.load(fr)
     return file
+
+def pretrain(
+        pretrainer,
+):
+    pretrainer.pretrain()
+    return pretrainer
 
 
 def main():
@@ -467,6 +539,48 @@ def main():
     # )
 
     # model.load_state_dict(torch.load(open(args.resume_path, 'rb')))
+    if not os.path.exists('tmp2.pkl'):
+        pretrain_args = {
+            'pretrain_epoch': 300,
+            'pretrain_lr': 1e-3,
+            'pretrain_weight_decay': 1e-5
+        }
+        device = torch.device("cuda:{}".format(args.cuda))
+        pretrainer = HGTPretrainer(
+            voc_size_dict=voc_size_dict,
+            adj_dict=adj_dict,
+            padding_dict=padding_dict,
+            voc_dict=voc_dict,
+            n_ehr_edges=n_ehr_edges,
+            embedding_dim=args.dim,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dropout=args.dropout,
+            device=device,
+            cache_dir=cache_dir,
+            pretrain_args=pretrain_args
+        )
+        X_raw = pretrainer.encoder.get_embedding()
+        visualization(X_raw['med'], 'raw med')
+        visualization(X_raw['diag'], 'raw diag')
+        visualization(X_raw['proc'], 'raw proc')
+        pretrainer = pretrain(
+            pretrainer
+        )
+        res = pretrainer.get_encoded_embedding()
+        X_hat = res['X']
+        E_mem = res['E_mem']
+        visualization(X_hat['med'], 'now med')
+        visualization(X_hat['diag'], 'now diag')
+        visualization(X_hat['proc'], 'now proc')
+        visualization(E_mem['dp'], 'now edge dp')
+        visualization(E_mem['m'], 'now edge m')
+        torch.save(res, 'tmp.pkl')
+    else:
+        res = torch.load('tmp2.pkl')
+        X_hat = res['X']
+        E_mem = res['E_mem']
+    return
 
     train_sampler = None
     if args.ddp:
@@ -513,23 +627,20 @@ def main():
     else:
 
         device = torch.device("cuda:{}".format(args.cuda))
-        model = HGTDrugRec(
+        model = HGTDecoder(
             voc_size_dict=voc_size_dict,
-            adj_dict=adj_dict,
             padding_dict=padding_dict,
-            voc_dict=voc_dict,
-            cluster_matrix=cluster_matrix,
             n_ehr_edges=n_ehr_edges,
             embedding_dim=args.dim,
             n_heads=args.n_heads,
-            n_layers=args.n_layers,
             n_experts=args.n_experts,
-            n_protos=args.n_protos,
-            n_clusters=args.n_clusters,
-            n_select=1,
+            experts_k=args.experts_k,
             dropout=args.dropout,
             device=device,
-            cache_dir=cache_dir
+            X_hat=X_hat,
+            E_mem=E_mem,
+            ddi_adj=adj_dict['ddi_adj'],
+            # node2edge_agg=pretrainer.encoder.node2edge_agg,
         )
         model.to(device=device)
 
@@ -589,17 +700,18 @@ def main():
         return
 
     model.to(device=device)
+    print('parameters', get_n_params(model))
     # print('parameters', get_n_params(model))
     # exit()
     optimizer = Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    lr_scheduler = CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=10, T_mult=4, verbose=True)
+    lr_scheduler = CosineAnnealingWarmRestarts(optimizer=optimizer, T_0=25, T_mult=2, verbose=True)
     # start iterations
     history = defaultdict(list)
     best_epoch, best_ja = 0, 0
 
-    EPOCH = 50
+    EPOCH = args.epoch
     if args.debug:
-        EPOCH = 3
+        EPOCH = min(EPOCH, 3)
 
     for epoch in range(EPOCH):
         if args.ddp:
@@ -615,11 +727,13 @@ def main():
 
         model.train()
         bce_loss_lst, multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst = [[] for _ in range(6)]
-        for step, (records, masks, targets) in enumerate(train_dataloader):
+        adm_ja_lst, adm_prauc_lst, adm_avg_p_lst, adm_avg_r_lst, adm_avg_f1_lst, med_num_lst = [[] for _ in range(6)]
+        for step, (records, masks, targets, visit2edge) in enumerate(train_dataloader):
             # 做点yu
             records = {k: replace_with_padding_woken(v, -1, padding_dict[k]).to(device) for k, v in records.items()}
             masks = {k: v.to(device) for k, v in masks.items()}
             targets = {k: v.to(device) for k, v in targets.items()}
+            visit2edge = visit2edge.to(device)
 
             bsz, max_visit, _ = records['diag'].shape
             bce_loss_mask = (masks['key_padding_mask'] == False).unsqueeze(-1).repeat(1, 1,
@@ -627,7 +741,16 @@ def main():
                 bsz * max_visit, -1)
             true_visit_idx = bce_loss_mask.sum(-1) != 0
 
-            result, side_loss = model(records, masks, true_visit_idx)
+            result, side_loss = model(records, masks, true_visit_idx, visit2edge)
+
+            adm_ja, adm_prauc, adm_avg_p, adm_avg_r, adm_avg_f1, med_num = compute_metric(targets, result, bsz, max_visit, masks)
+            adm_ja_lst.append(adm_ja)
+            adm_prauc_lst.append(adm_prauc)
+            adm_avg_p_lst.append(adm_avg_p)
+            adm_avg_r_lst.append(adm_avg_r)
+            adm_avg_f1_lst.append(adm_avg_f1)
+            med_num_lst.append(med_num)
+
             loss_ddi = side_loss['ddi']
             loss_ssl = side_loss['ssl']
             loss_moe = side_loss['moe']
@@ -637,22 +760,13 @@ def main():
                 reduction='none'
             ).mean()
 
+            # loss_bce = multilabel_categorical_crossentropy(targets['loss_bce_target'].reshape(bsz * max_visit, -1)[true_visit_idx], result)
+
             # multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit)
             loss_multi = F.multilabel_margin_loss(
                 F.sigmoid(result),
                 targets['loss_multi_target'].reshape(bsz * max_visit, -1)[true_visit_idx], reduction='none'
             ).mean()
-
-            # loss_bce = (F.binary_cross_entropy_with_logits(
-            #     result.reshape(bsz * max_visit, -1), targets['loss_bce_target'].reshape(bsz * max_visit, -1),
-            #     reduction='none'
-            # ) * bce_loss_mask)[true_visit_idx].sum(1).mean()
-            #
-            # multi_loss_mask = (masks['key_padding_mask'] == False).reshape(bsz * max_visit)
-            # loss_multi = (F.multilabel_margin_loss(
-            #     F.sigmoid(result).reshape(bsz * max_visit, -1),
-            #     targets['loss_multi_target'].reshape(bsz * max_visit, -1), reduction='none'
-            # )[multi_loss_mask]).mean()
 
             result_binary = F.sigmoid(result).detach().cpu().numpy()
             result_binary[result_binary >= 0.5] = 1
@@ -704,6 +818,7 @@ def main():
             optimizer.step()
 
             llprint("\rtraining step: {} / {}".format(step, len(train_dataloader)))
+
         if args.ddp:
             if dist.get_rank() == 0:
                 best_epoch, best_ja, cur_ja = log_and_eval(model.module,
@@ -714,84 +829,27 @@ def main():
                                                    best_epoch)
 
         else:
+            print("\nTrain: Jaccard: {:.4},  PRAUC: {:.4}, AVG_PRC: {:.4}, AVG_RECALL: {:.4}, AVG_F1: {:.4}, AVG_MED: {:.4}\n".format(
+                np.mean(adm_ja_lst),
+                np.mean(adm_prauc_lst),
+                np.mean(adm_avg_p_lst),
+                np.mean(adm_avg_r_lst),
+                np.mean(adm_avg_f1_lst),
+                np.mean(med_num_lst),
+            ))
             best_epoch, best_ja, cur_ja = log_and_eval(model, eval_dataloader, voc_size, epoch, padding_dict, tic, history,
                                                args, bce_loss_lst,
                                                multi_loss_lst, ddi_loss_lst, ssl_loss_lst, moe_loss_lst, total_loss_lst,
                                                best_ja,
                                                best_epoch)
         lr_scheduler.step()
-        # print()
-        # tic2 = time.time()
-        # ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(
-        #     model, eval_dataloader, voc_size, epoch, padding_dict
-        # )
-        # print(
-        #     "training time: {}, test time: {}".format(
-        #         time.time() - tic, time.time() - tic2
-        #     )
-        # )
-        #
-        #
-        # history["ja"].append(ja)
-        # history["ddi_rate"].append(ddi_rate)
-        # history["avg_p"].append(avg_p)
-        # history["avg_r"].append(avg_r)
-        # history["avg_f1"].append(avg_f1)
-        # history["prauc"].append(prauc)
-        # history["med"].append(avg_med)
-        #
-        # if args.wandb:
-        #     wandb.log({
-        #         'ja': ja,
-        #         'ddi_rate': ddi_rate,
-        #         'avg_p': avg_p,
-        #         'avg_r': avg_r,
-        #         'avg_f1': avg_f1,
-        #         'prauc': prauc,
-        #         'med': avg_med,
-        #         'bce_loss': np.mean(bce_loss_lst),
-        #         'multi_loss': np.mean(multi_loss_lst),
-        #         'ddi_loss': np.mean(ddi_loss_lst),
-        #         'ssl_loss': np.mean(ssl_loss_lst),
-        #         'total_loss': np.mean(total_loss_lst),
-        #     })
-        #
-        # if epoch >= 5:
-        #     print(
-        #         "ddi: {}, Med: {}, Ja: {}, F1: {}, PRAUC: {}".format(
-        #             np.mean(history["ddi_rate"][-5:]),
-        #             np.mean(history["med"][-5:]),
-        #             np.mean(history["ja"][-5:]),
-        #             np.mean(history["avg_f1"][-5:]),
-        #             np.mean(history["prauc"][-5:]),
-        #         )
-        #     )
-        #
-        # torch.save(
-        #     model.state_dict(),
-        #     open(
-        #         os.path.join(
-        #             "saved",
-        #             args.model_name,
-        #             "Epoch_{}_TARGET_{:.2}_JA_{:.4}_DDI_{:.4}.model".format(
-        #                 epoch, args.target_ddi, ja, ddi_rate
-        #             ),
-        #         ),
-        #         "wb",
-        #     ),
-        # )
-        #
-        # if epoch != 0 and best_ja < ja:
-        #     best_epoch = epoch
-        #     best_ja = ja
-        #
-        # print("best_epoch: {}".format(best_epoch))
+
     # 测试
     if args.ddp:
         if dist.get_rank() == 0:
-            test_model(model.module, args, device, data_test, voc_size, 0, padding_dict)
+            test_model(model.module, args, device, data_test, voc_size, best_epoch, padding_dict)
     else:
-        test_model(model, args, device, data_test, voc_size, 0, padding_dict)
+        test_model(model, args, device, data_test, voc_size, best_epoch, padding_dict)
 
     if args.wandb:
         if args.ddp:
@@ -821,6 +879,8 @@ def main():
                 "wb",
             ),
         )
+
+
 
 
 if __name__ == "__main__":

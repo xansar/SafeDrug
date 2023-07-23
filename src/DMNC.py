@@ -113,7 +113,7 @@ def main():
 
     EPOCH = 40
     LR = 0.0005
-    TEST = True
+    TEST = False
     END_TOKEN = voc_size[2] + 1
 
     model = DMNC(voc_size, device=device)

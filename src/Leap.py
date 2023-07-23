@@ -22,7 +22,7 @@ torch.manual_seed(1203)
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
 model_name = 'Leap'
-resume_path = 'saved/{}/Epoch_49_JA_0.4603_DDI_0.07427.model'.format(model_name)
+resume_path = 'saved/{}/Epoch_49_JA_0.4586_DDI_0.07906.model'.format(model_name)
 
 if not os.path.exists(os.path.join("saved", model_name)):
         os.makedirs(os.path.join("saved", model_name))
@@ -75,7 +75,7 @@ def eval(model, data_eval, voc_size, epoch):
         smm_record.append(y_pred_label)
 
         adm_ja, adm_prauc, adm_avg_p, adm_avg_r, adm_avg_f1 = \
-                sequence_metric(np.array(y_gt), np.array(y_pred), np.array(y_pred_prob), np.array(y_pred_label))
+                sequence_metric(np.array(y_gt), np.array(y_pred), np.array(y_pred_prob), y_pred_label)
         ja.append(adm_ja)
         prauc.append(adm_prauc)
         avg_p.append(adm_avg_p)
@@ -97,7 +97,7 @@ def main():
     # load data
     data_path = '../data/records_final.pkl'
     voc_path = '../data/voc_final.pkl'
-    device = torch.device('cuda')
+    device = torch.device('cuda:1')
 
     data = dill.load(open(data_path, 'rb'))
     voc = dill.load(open(voc_path, 'rb'))
@@ -121,7 +121,9 @@ def main():
         tic = time.time()
         result = []
         for _ in range(10):
-            test_sample = np.random.choice(data_test, round(len(data_test) * 0.8), replace=True)
+            idx = np.arange(len(data_test))
+            test_sample_idx = np.random.choice(idx, round(len(data_test) * 0.8), replace=True)
+            test_sample = [data_test[i] for i in test_sample_idx]
             ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(model, test_sample, voc_size, 0)
             result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
         

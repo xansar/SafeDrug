@@ -18,7 +18,7 @@ from util import llprint, multi_label_metric, ddi_rate_score, get_n_params
 
 torch.manual_seed(1203)
 model_name = 'Retain'
-resume_path = 'Epoch_50_JA_0.4952_DDI_0.08157.model'
+resume_path = 'Epoch_42_JA_0.4948_DDI_0.08835.model'
 
 # os.environ["CUDA_VISIBLE_DEVICES"] = "3"
 
@@ -98,7 +98,7 @@ def main():
     # load data
     data_path = '../data/records_final.pkl'
     voc_path = '../data/voc_final.pkl'
-    device = torch.device('cuda')
+    device = torch.device('cuda:1')
 
     data = dill.load(open(data_path, 'rb'))
     voc = dill.load(open(voc_path, 'rb'))
@@ -121,7 +121,9 @@ def main():
 
         result = []
         for _ in range(10):
-            test_sample = np.random.choice(data_test, round(len(data_test) * 0.8), replace=True)
+            idx = np.arange(len(data_test))
+            test_sample_idx = np.random.choice(idx, round(len(data_test) * 0.8), replace=True)
+            test_sample = [data_test[i] for i in test_sample_idx]
             ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(model, test_sample, voc_size, 0)
             result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
         

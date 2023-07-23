@@ -18,7 +18,7 @@ from util import llprint, multi_label_metric, ddi_rate_score, get_n_params
 torch.manual_seed(1203)
 
 model_name = 'GAMENet'
-resume_name = 'saved/GAMENet/Epoch_49_JA_0.5073_DDI_0.0858.model'
+resume_name = 'saved/GAMENet/Epoch_49_JA_0.5046_DDI_0.08728.model'
 
 if not os.path.exists(os.path.join("saved", model_name)):
         os.makedirs(os.path.join("saved", model_name))
@@ -126,7 +126,9 @@ def main():
         tic = time.time()
         result = []
         for _ in range(10):
-            test_sample = np.random.choice(data_test, round(len(data_test) * 0.8), replace=True)
+            idx = np.arange(len(data_test))
+            test_sample_idx = np.random.choice(idx, round(len(data_test) * 0.8), replace=True)
+            test_sample = [data_test[i] for i in test_sample_idx]
             ddi_rate, ja, prauc, avg_p, avg_r, avg_f1, avg_med = eval(model, test_sample, voc_size, 0)
             result.append([ddi_rate, ja, avg_f1, prauc, avg_med])
         

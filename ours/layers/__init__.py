@@ -9,3 +9,5 @@
 """
 from .model import HyperDrugRec
 from .hypergraph_gps_model import HGTDrugRec
+from .hgt_decoder import HGTDecoder
+from .hgt_encoder import HGTEncoder

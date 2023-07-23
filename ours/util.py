@@ -265,7 +265,8 @@ def multi_label_metric(y_gt, y_pred, y_prob):
 
 def ddi_rate_score(record, path="../data/ddi_A_final.pkl"):
     # ddi rate
-    ddi_A = dill.load(open(path, "rb"))
+    with open(path, 'rb') as f:
+        ddi_A = dill.load(f)
     all_cnt = 0
     dd_cnt = 0
     for patient in record:

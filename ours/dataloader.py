@@ -19,15 +19,30 @@ class MIMICDataset(Dataset):
     def __init__(self, data):
         super(MIMICDataset, self).__init__()
         self.data = data
+        visit_num = 0
+        self.patient_id2edge_idx = {}
+        for u, visits in enumerate(data):
+            edge_lst = []
+            for t, v in enumerate(visits):
+                # 这里v是[诊断，手术，药物]ken
+                edge_lst.append(visit_num)
+                visit_num += 1
+            self.patient_id2edge_idx[u] = edge_lst
 
     def __getitem__(self, idx):
-        return self.data[idx]
+        return self.data[idx], self.patient_id2edge_idx[idx]
+        # return self.data[idx]
 
     def __len__(self):
         return len(self.data)
 
 def collate_fn(X):
     pad_token = -1
+    visit2edge = []
+    for x in X:
+        visit2edge += x[1]
+    visit2edge = torch.tensor(visit2edge)
+    X = [x[0] for x in X]
     length = [len(x) for x in X]
     max_T = max(length)
     batch_size = len(X)
@@ -109,7 +124,7 @@ def collate_fn(X):
         'loss_bce_target': loss_bce_target,
         'loss_multi_target': loss_multi_target
     }
-    return records, masks, target
+    return records, masks, target, visit2edge
 
 
 if __name__ == '__main__':

@@ -124,24 +124,34 @@ class SparseDispatcher(object):
         # split nonzero gates for each expert
         return torch.split(self._nonzero_gates, self._part_sizes, dim=0)
 
+
 class MLP(nn.Module):
-    def __init__(self, input_size, output_size, hidden_size):
+    def __init__(self, input_size, output_size, hidden_size, dropout):
         super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_size, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, output_size)
-        self.relu = nn.ReLU()
+        self.mlp = nn.Sequential(
+            nn.LayerNorm(input_size),
+            nn.Linear(input_size, hidden_size),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, output_size),
+            nn.LeakyReLU(),
+            nn.LayerNorm(output_size)
+        )
+        # self.norm_1 = nn.LayerNorm(input_size)
+        # self.fc1 = nn.Linear(input_size, hidden_size)
+        # self.fc2 = nn.Linear(hidden_size, output_size)
+        # self.relu = nn.ReLU()
         # self.soft = nn.Softmax(1)
 
     def forward(self, x):
-        out = self.fc1(x)
-        out = self.relu(out)
-        out = self.fc2(out) + x
+        # out = self.norm_1(x)
+        # out = self.fc1(out)
+        # out = self.relu(out)
+        # out = self.fc2(out)
         # out = self.soft(out)
-        return out
+        return self.mlp(x)
 
 
 class MoE(nn.Module):
-
     """Call a Sparsely gated mixture of experts layer with 1-layer Feed-Forward networks as experts.
     Args:
     input_size: integer - size of the input
@@ -152,16 +162,18 @@ class MoE(nn.Module):
     k: an integer - how many experts to use for each batch element
     """
 
-    def __init__(self, input_size, output_size, num_experts, hidden_size, noisy_gating=True, k=4):
+    def __init__(self, input_size, output_size, num_experts, hidden_size, dropout, noisy_gating=True, k=4):
         super(MoE, self).__init__()
         self.noisy_gating = noisy_gating
         self.num_experts = num_experts
         self.output_size = output_size
         self.input_size = input_size
         self.hidden_size = hidden_size
+        self.dropout = dropout
         self.k = k
         # instantiate experts
-        self.experts = nn.ModuleList([MLP(self.input_size, self.output_size, self.hidden_size) for i in range(self.num_experts)])
+        self.experts = nn.ModuleList(
+            [MLP(self.input_size, self.output_size, self.hidden_size, self.dropout) for i in range(self.num_experts)])
         self.w_gate = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
         self.w_noise = nn.Parameter(torch.zeros(input_size, num_experts), requires_grad=True)
 
@@ -169,7 +181,7 @@ class MoE(nn.Module):
         self.softmax = nn.Softmax(1)
         self.register_buffer("mean", torch.tensor([0.0]))
         self.register_buffer("std", torch.tensor([1.0]))
-        assert(self.k <= self.num_experts)
+        assert (self.k <= self.num_experts)
 
     def cv_squared(self, x):
         """The squared coefficient of variation of a sample.
@@ -186,7 +198,7 @@ class MoE(nn.Module):
 
         if x.shape[0] == 1:
             return torch.tensor([0], device=x.device, dtype=x.dtype)
-        return x.float().var() / (x.float().mean()**2 + eps)
+        return x.float().var() / (x.float().mean() ** 2 + eps)
 
     def _gates_to_load(self, gates):
         """Compute the true load per expert, given the gates.
@@ -226,8 +238,8 @@ class MoE(nn.Module):
         threshold_if_out = torch.unsqueeze(torch.gather(top_values_flat, 0, threshold_positions_if_out), 1)
         # is each value currently in the top k.
         normal = Normal(self.mean, self.std)
-        prob_if_in = normal.cdf((clean_values - threshold_if_in)/noise_stddev)
-        prob_if_out = normal.cdf((clean_values - threshold_if_out)/noise_stddev)
+        prob_if_in = normal.cdf((clean_values - threshold_if_in) / noise_stddev)
+        prob_if_out = normal.cdf((clean_values - threshold_if_out) / noise_stddev)
         prob = torch.where(is_in, prob_if_in, prob_if_out)
         return prob
 
@@ -292,16 +304,18 @@ class MoE(nn.Module):
         y = dispatcher.combine(expert_outputs)
         return y, loss
 
+
 class MoEPredictor(nn.Module):
-    def __init__(self, embed_dim, output_size, n_experts):
+    def __init__(self, embed_dim, output_size, n_experts, k, dropout):
         super(MoEPredictor, self).__init__()
         self.moe = MoE(
             input_size=embed_dim,
             output_size=output_size,
             num_experts=n_experts,
-            hidden_size=embed_dim,
+            hidden_size=output_size,
+            dropout=dropout,
             noisy_gating=True,
-            k=n_experts
+            k=k  # 稀疏激活
         )
 
     def forward(self, E):
