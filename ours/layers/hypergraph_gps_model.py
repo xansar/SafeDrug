@@ -16,7 +16,7 @@ from torch_geometric.nn.dense.linear import Linear as pyg_Linear
 from torch_geometric.nn.inits import glorot
 
 # from .conv import HyperGraphEncoder
-from .HypergraphGPSEncoder import HypergraphGPSEncoder, Node2EdgeAggregator
+from .hgt_encoder import HGTEncoder, Node2EdgeAggregator
 from .moe import MoEPredictor
 from .ehr_memory_attn import EHRMemoryAttention
 
@@ -89,7 +89,7 @@ class HGTDrugRec(nn.Module):
 
         self.graph_encoder = nn.ModuleDict(
             {
-                n: HypergraphGPSEncoder(
+                n: HGTEncoder(
                     embed_dim=embedding_dim,
                     n_heads=n_heads,
                     dropout=dropout,

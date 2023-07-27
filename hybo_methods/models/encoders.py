@@ -12,9 +12,9 @@ class Encoder(nn.Module):
     def encode(self, x, adj):
         if self.encode_graph:
             input = (x, adj)
-            output, _ = self.layers.forward(input,,
+            output, _ = self.layers.forward(input,,,,
         else:
-            output = self.layers.forward(x,,
+            output = self.layers.forward(x,,,,
         return output
 
 

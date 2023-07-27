@@ -19,19 +19,18 @@ import wandb
 
 import torch.distributed as dist
 
-from layers import HGTDrugRec
+# from layers import HGTDrugRec
 from layers import HGTDecoder
-from graph_construction import construct_graphs, graph2hypergraph, desc_hypergraph_construction
-from util import llprint, multi_label_metric, ddi_rate_score, buildMPNN, replace_with_padding_woken, multihot2idx
+from graph_construction import construct_graphs
+from util import llprint, multi_label_metric, ddi_rate_score, replace_with_padding_woken, multihot2idx
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from dataloader import collate_fn, MIMICDataset
 from config import parse_args
 
-from build_pretrainer import HGTPretrainer
+from pretrain import HGTPretrainer
 from graph_construction import visualization
 
-from multi_category_loss import multilabel_categorical_crossentropy
 
 torch.manual_seed(1203)
 np.random.seed(2048)
@@ -73,7 +72,7 @@ def init_wandb(args):
                 'n_heads': args.n_heads
             },
 
-            name=f'{args.model_name}_lr_{args.lr}_w_decay_{args.weight_decay}_win_sz_{args.win_sz}_layers_{args.n_layers}',
+            name=f'{args.model_name}_{args.name}_drop_{args.dropout}_lr_{args.lr}_w_decay_{args.weight_decay}_win_sz_{args.win_sz}_layers_{args.n_layers}',
 
             # dir
             dir='./saved'
@@ -374,9 +373,11 @@ def test_model(model, args, device, data_test, voc_size, best_epoch, padding_dic
 
     log_hyperparam_lst = [
         'model_name',
+        'name',
         'lr',
         'weight_decay',
-        'bsz', 'win_sz',
+        'bsz',
+        'win_sz',
         'n_layers',
         'dim',
         'n_heads',
@@ -432,13 +433,6 @@ def dill_load(pth, mode='rb'):
     with open(pth, mode) as fr:
         file = dill.load(fr)
     return file
-
-def pretrain(
-        pretrainer,
-):
-    pretrainer.pretrain()
-    return pretrainer
-
 
 def main():
     args = parse_args()
@@ -503,8 +497,8 @@ def main():
 
     # ddi
     adj_dict['ddi_adj'] = torch.FloatTensor(ddi_adj)
-    h_ddi_adj = graph2hypergraph(adj_dict['ddi_adj'])  # 超图
-    adj_dict['med'] = torch.cat([adj_dict['med'], h_ddi_adj], dim=-1).coalesce()
+    # h_ddi_adj = graph2hypergraph(adj_dict['ddi_adj'])  # 超图
+    # adj_dict['med'] = torch.cat([adj_dict['med'], h_ddi_adj], dim=-1).coalesce()
 
     if args.debug:
         data_train = data_train[:100]
@@ -539,48 +533,88 @@ def main():
     # )
 
     # model.load_state_dict(torch.load(open(args.resume_path, 'rb')))
-    if not os.path.exists('tmp2.pkl'):
-        pretrain_args = {
-            'pretrain_epoch': 300,
-            'pretrain_lr': 1e-3,
-            'pretrain_weight_decay': 1e-5
-        }
+    name_lst = ['diag', 'proc', 'med']
+    if args.pretrain:
         device = torch.device("cuda:{}".format(args.cuda))
         pretrainer = HGTPretrainer(
-            voc_size_dict=voc_size_dict,
+            args,
+            num_dict=voc_size_dict,
+            num_edges=n_ehr_edges,
             adj_dict=adj_dict,
-            padding_dict=padding_dict,
-            voc_dict=voc_dict,
-            n_ehr_edges=n_ehr_edges,
-            embedding_dim=args.dim,
-            n_heads=args.n_heads,
-            n_layers=args.n_layers,
-            dropout=args.dropout,
             device=device,
+            voc_dict=voc_dict,
             cache_dir=cache_dir,
-            pretrain_args=pretrain_args
         )
-        X_raw = pretrainer.encoder.get_embedding()
-        visualization(X_raw['med'], 'raw med')
-        visualization(X_raw['diag'], 'raw diag')
-        visualization(X_raw['proc'], 'raw proc')
-        pretrainer = pretrain(
-            pretrainer
+        # for n in name_lst:
+        #     model = pretrainer.model_dict[n]
+        #     adj = pretrainer.adj_dict[n]
+        #     X_raw, E_raw = pretrainer.get_raw_node_edge_representation(model, adj)
+        #     visualization(X_raw, f'raw nodes {n}')
+        pretrainer.pretrain()
+
+        res_X = {}
+        res_E = {}
+        for n in name_lst:
+            model = pretrainer.model_dict[n]
+            adj = pretrainer.adj_dict[n]
+            res = pretrainer.get_encoded_embedding(model, adj)
+            X_hat = res['X']
+            E_hat = res['E']
+            visualization(X_hat, f'encoded nodes {n}')
+            visualization(E_hat, f'encoded edges {n}')
+            res_X[n] = X_hat.to('cpu')
+            res_E[n] = E_hat.to('cpu')
+
+        torch.save(
+            {
+                'X': res_X,
+                'E': res_E
+            }
+            , 'tmp4.pkl'
         )
-        res = pretrainer.get_encoded_embedding()
-        X_hat = res['X']
-        E_mem = res['E_mem']
-        visualization(X_hat['med'], 'now med')
-        visualization(X_hat['diag'], 'now diag')
-        visualization(X_hat['proc'], 'now proc')
-        visualization(E_mem['dp'], 'now edge dp')
-        visualization(E_mem['m'], 'now edge m')
-        torch.save(res, 'tmp.pkl')
+        return
+        # model = HGTCL(
+        #     voc_size_dict=voc_size_dict,
+        #     adj_dict=adj_dict,
+        #     voc_dict=voc_dict,
+        #     n_ehr_edges=n_ehr_edges,
+        #     device=device,
+        #     cache_dir=cache_dir,
+        #     args=args
+        # )
+        # pretrainer = HGTPretrainer(
+        #     model=model.to(device),
+        #     voc_size_dict=voc_size_dict,
+        #     adj_dict=adj_dict,
+        #     n_ehr_edges=n_ehr_edges,
+        #     device=device,
+        #     args=args
+        # )
+        # # X_raw, E_raw = pretrainer.model.get_features()
+        # # visualization(X_raw['med'], 'raw med')
+        # # visualization(X_raw['diag'], 'raw diag')
+        # # visualization(X_raw['proc'], 'raw proc')
+        # pretrainer.pretrain()
+        # X_hat, E_mem = pretrainer.get_encoded_features()
+        # visualization(X_hat['med'], 'now med')
+        # visualization(X_hat['diag'], 'now diag')
+        # visualization(X_hat['proc'], 'now proc')
+        # visualization(E_mem['dp'], 'now edge dp')
+        # visualization(E_mem['m'], 'now edge m')
+        # # torch.save(res, 'tmp3.pkl')
+        # torch.save(
+        #     {
+        #         'X': X_hat.to('cpu'),
+        #         'E_mem': E_mem.to('cpu')
+        #     }
+        #     , 'tmp3.pkl'
+        # )
+        # return
     else:
-        res = torch.load('tmp2.pkl')
+        res = torch.load('tmp3.pkl')
+        # res = torch.load('tmp.pkl')
         X_hat = res['X']
-        E_mem = res['E_mem']
-    return
+        E_mem = res['E']
 
     train_sampler = None
     if args.ddp:
@@ -625,7 +659,6 @@ def main():
             if not args.Test:
                 init_wandb(args)
     else:
-
         device = torch.device("cuda:{}".format(args.cuda))
         model = HGTDecoder(
             voc_size_dict=voc_size_dict,

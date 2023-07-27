@@ -4,298 +4,294 @@
 @author: xansar
 @software: PyCharm
 @file: hgt_encoder.py
-@time: 2023/7/11 16:33
+@time: 2023/6/22 15:51
 @e-mail: xansar@ruc.edu.cn
 """
-"""
-负责基于图进行预训练,用来做embedding初始化
-考虑将diag和proc合并成一张图
-"""
+import os.path
 
 import torch
-import torch.nn as nn
 import torch.sparse as tsp
-import torch.nn.functional as F
-import faiss
-
-from .hypergraph_gps_model import HypergraphGPSEncoder, Node2EdgeAggregator
-from info_nce import InfoNCE
+import torch.nn as nn
+from .HypergraphConv import HypergraphConv
+from .position_encoding import FeatureEncoder
 
 
-class HGTEncoder(nn.Module):
-    def __init__(self, embedding_dim, n_heads, dropout, n_layers, adj_dict, voc_dict, cache_dir, device, voc_size_dict,
-                 n_ehr_edges, padding_dict):
-        super(HGTEncoder, self).__init__()
-        self.name_lst = ['diag', 'proc', 'med']
-        self.num_dict = voc_size_dict
-        self.n_ehr_edges = n_ehr_edges
-        self.padding_dict = padding_dict
-        self.device = device
+class MPNN(nn.Module):
+    """
+    local MPNN part
+    """
 
-        self.adj_dict = {k: v.to(device) for k, v in adj_dict.items()}
-        # 为每个超边赋予一个可学习的权重
-        self.edge_weight_dict = nn.ParameterDict()
-        for n in self.name_lst:
-            adj = self.adj_dict[n]
-            n_edge = adj.shape[1]
-            weight = torch.rand(n_edge)
-            weight = torch.nn.Parameter(weight, requires_grad=True).to(device)
-            self.edge_weight_dict[n] = weight
-
-        self.info_nce_loss = InfoNCE(reduction='mean')
-
-        self.embedding = nn.ModuleDict(
-            {
-                n: nn.Embedding(
-                    num_embeddings=self.num_dict[n] + 1,
-                    embedding_dim=embedding_dim,
-                    padding_idx=self.padding_dict[n])
-                for n in self.name_lst
-            }
+    def __init__(self, embed_dim, n_heads, dropout):
+        super(MPNN, self).__init__()
+        self.conv = HypergraphConv(
+            in_channels=embed_dim,
+            out_channels=embed_dim,
+            use_attention=True,
+            heads=n_heads, dropout=dropout,
+            concat=False
         )
+        # 超边特征计算,对所有节点做线性变换然后求和,加上对超边特征变换求和
+        # 原始GatedGCN中分别对头尾节点使用不同的变换,这里统一成相同的
+        self.node_ffn = nn.Linear(embed_dim, embed_dim)
+        self.edge_ffn = nn.Linear(embed_dim, embed_dim)
 
-        self.embedding_norm = nn.ModuleDict(
-            {
-                n: nn.BatchNorm1d(embedding_dim)
-                for n in self.name_lst
-            }
-        )
+    def reset_parameters(self):
+        self.conv.reset_parameters()
+        self.node_ffn.reset_parameters()
+        self.edge_ffn.reset_parameters()
 
-        self.graph_encoder = nn.ModuleDict(
-            {
-                n: HypergraphGPSEncoder(
-                    embed_dim=embedding_dim,
-                    n_heads=n_heads,
-                    dropout=dropout,
-                    n_layers=n_layers,
-                    H=adj_dict[n],
-                    idx2word=voc_dict[n].idx2word,
-                    cache_dir=cache_dir,
-                    device=device,
-                    name=n,
-                )
-                for n in self.name_lst
-            }
-        )
-
-        self.node2edge_agg = nn.ModuleDict(
-            {
-                n: Node2EdgeAggregator(embedding_dim, n_heads, dropout)
-                for n in self.name_lst
-            }
-        )
-
-        self.node_in_edge = self.compute_node_id_in_edges()
-
-        self.ssl_temp = 0.1
-        self.ssl_reg = 1e-3
-        self.embedding_dim = embedding_dim
-        self.n_protos = 128
-        self.domain_ssl_weight = 0.1
-        self.cluster_ssl_weight = 1.
-        self.node2edge_ssl_weight = 0.1
-        self.dp2med_ssl_weight = 0.1
-
-    def compute_node_id_in_edges(self):
-        node_in_edge = {}
-        for n in self.name_lst:
-            adj = self.adj_dict[n].to_dense()[:, :self.n_ehr_edges]
-            assert adj.shape == (self.num_dict[n], self.n_ehr_edges)
-
-            max_size = torch.sum(adj, 0).max().int().item()
-            pos_matrix = torch.empty((self.n_ehr_edges, max_size))
-            pos_matrix = torch.fill(pos_matrix, -1)
-            pos_idx = torch.argwhere(adj.T == 1).cpu()
-            for i in range(self.n_ehr_edges):
-                indices = pos_idx[pos_idx[:, 0] == i][:, 1]  # 找到第i条边包含哪几个节点
-                length = len(indices)
-                pos_matrix[i, :length] = indices
-            pos_matrix = torch.where(pos_matrix == -1, self.padding_dict[n], pos_matrix)
-            node_in_edge[n] = pos_matrix.long()
-        return node_in_edge
-
-    def get_embedding(self):
-        """
-        获取embedding
-        Returns:
-
-        """
-        x = {}
-        for n in self.name_lst:
-            idx = torch.arange(self.num_dict[n], dtype=torch.long, device=self.device)
-            x[n] = self.embedding_norm[n](self.embedding[n](idx))
-        return x
-
-    def get_hyperedge_representation(self, embed, adj):
+    def compute_edge_feat(self, X, E, H):
         """
         获取超边的表示，通过聚合当前超边下所有item的embedding
         实际上就是乘以H(n_edges, n_items)
         Args:
-            embed:
-            adj:
+            X: 节点特征
+            E: 边特征
+            H:
 
         Returns:
 
         """
 
         # embed: n_items, dim
-        n_items, n_edges = adj.shape
-        if adj.is_sparse:
-            norm_factor = (tsp.sum(adj, dim=0) ** -1).to_dense().reshape(n_edges, -1)
+        n_items, n_edges = H.shape
+        if H.is_sparse:
+            norm_factor = (tsp.sum(H, dim=0) ** -1).to_dense().reshape(n_edges, -1)
             assert norm_factor.shape == (n_edges, 1)
-            E = norm_factor * tsp.mm(adj.T, embed)
+            X_trans = self.node_ffn(X)
+            # E计算:变换后的节点聚合,原始E变换,原始E
+            agg_edge_feat = norm_factor * tsp.mm(H.T, X_trans)
+            E_res = agg_edge_feat + self.edge_ffn(E) + E
         else:
-            norm_factor = (torch.sum(adj, dim=0) ** -1).reshape(n_edges, -1)
+            norm_factor = (torch.sum(H, dim=0) ** -1).reshape(n_edges, -1)
             assert norm_factor.shape == (n_edges, 1)
-            E = norm_factor * torch.mm(adj.T, embed)
+            X_trans = self.node_ffn(X)
+            # E计算:变换后的节点聚合,原始E变换,原始E
+            agg_edge_feat = norm_factor * tsp.mm(H.T, X_trans)
+            E_res = agg_edge_feat + self.edge_ffn(E) + E
 
-        return E
+        return E_res
 
-    def graph_encode(self, x, adj, edge_weight):
+    def forward(self, X, E, H, edge_weight):
+        adj_index = H.indices()
+        E_res = self.compute_edge_feat(X, E, H)
+        X_res = self.conv(X, adj_index, hyperedge_attr=E_res, hyperedge_weight=edge_weight)
+        return X_res, E_res
+
+
+class GlobalAttention(nn.Module):
+    """
+    global attention part
+    """
+
+    def __init__(self, embed_dim, n_heads, dropout):
+        super(GlobalAttention, self).__init__()
+        self.self_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+    def reset_parameters(self):
+        self.self_attn._reset_parameters()
+
+    def forward(self, X, ke_bias=None):
+        X_attn = self._sa_block(X, ke_bias, None)  # 这里attn_mask如果是float类型,可以直接加到attn_weights上面
+        return X_attn
+
+    def _sa_block(self, x, attn_mask, key_padding_mask):
+        """Self-attention block.
         """
-        进行超图编码
+        # Requires PyTorch v1.11+ to support `average_attn_weights=False`
+        # option to return attention weights of individual heads.
+        x, A = self.self_attn(x, x, x,
+                              attn_mask=attn_mask,
+                              key_padding_mask=key_padding_mask,
+                              need_weights=True,
+                              average_attn_weights=False)
+        # self.attn_weights = A.detach().cpu()
+        return x
+
+
+class FeedForwardLayer(nn.Module):
+    def __init__(self, embed_dim, dropout):
+        super(FeedForwardLayer, self).__init__()
+        # Feed Forward block.
+        self.ff_linear1 = nn.Linear(embed_dim, embed_dim * 2)
+        self.ff_linear2 = nn.Linear(embed_dim * 2, embed_dim)
+        self.act_fn_ff = nn.LeakyReLU()
+        self.ff_dropout1 = nn.Dropout(dropout)
+        self.ff_dropout2 = nn.Dropout(dropout)
+
+    def reset_parameters(self):
+        self.ff_linear1.reset_parameters()
+        self.ff_linear2.reset_parameters()
+
+    def forward(self, x):
+        """Feed Forward block.
+        """
+        x = self.ff_dropout1(self.act_fn_ff(self.ff_linear1(x)))
+        return self.ff_dropout2(self.ff_linear2(x))
+
+
+class HGTEncoderLayer(nn.Module):
+    """
+    参考GraphGPS,变成超图
+    """
+
+    def __init__(self, embed_dim, n_heads, dropout):
+        super(HGTEncoderLayer, self).__init__()
+        self.MPNN_layer = MPNN(embed_dim, n_heads, dropout)
+        self.global_att = GlobalAttention(embed_dim, n_heads, dropout)
+
+        self.local_ln = nn.LayerNorm(embed_dim)
+        self.local_dropout = nn.Dropout(dropout)
+        self.global_ln = nn.LayerNorm(embed_dim)
+        self.global_dropout = nn.Dropout(dropout)
+
+        self.node_ff_block = FeedForwardLayer(embed_dim, dropout)
+        self.node_norm = nn.LayerNorm(embed_dim)
+
+        self.edge_norm = nn.LayerNorm(embed_dim)
+
+    def reset_parameters(self):
+        self.MPNN_layer.reset_parameters()
+        self.global_att.reset_parameters()
+        self.local_ln.reset_parameters()
+        self.global_ln.reset_parameters()
+        self.node_ff_block.reset_parameters()
+        self.node_norm.reset_parameters()
+        self.edge_norm.reset_parameters()
+
+    def forward(self, X, E, H, edge_weight, ke_bias):
+        """
+
         Args:
-            x: dict
-            adj: dict
+            X: 节点特征
+            E: 边特征
+            H: 邻接矩阵
+            edge_weight: 超边权重
+        Returns:
+
+        """
+        X_M_hat, E_res_hat = self.MPNN_layer(X, E, H, edge_weight)
+        E_res = self.edge_norm(E_res_hat)
+        X_M = self.local_ln(self.local_dropout(X_M_hat) + X)
+
+        X_T_hat = self.global_att(X, ke_bias)
+        X_T = self.global_ln(self.global_dropout(X_T_hat) + X)
+
+        X_res = self.node_norm(self.node_ff_block(X_M + X_T) + X_M + X_T)
+        return X_res, E_res
+
+
+class HGTEncoder(nn.Module):
+    def __init__(self, embed_dim, n_heads, dropout, n_layers, H, idx2word, cache_dir, device, name):
+        super(HGTEncoder, self).__init__()
+        self.n_layers = n_layers
+        self.name = name
+        cache_dir = os.path.join(cache_dir, name)
+        if not os.path.exists(cache_dir):
+            os.makedirs(cache_dir)
+        self.feature_encoder = FeatureEncoder(
+            H=H,
+            idx2word=idx2word,
+            se_dim=embed_dim,
+            pe_dim=embed_dim,
+            ke_dim=embed_dim,
+            cache_dir=cache_dir,
+            device=device,
+            name=name,
+        )
+
+        self.encoders = nn.ModuleList()
+        for i in range(n_layers):
+            self.encoders.append(
+                HGTEncoderLayer(
+                    embed_dim=embed_dim,
+                    n_heads=n_heads,
+                    dropout=dropout
+                )
+            )
+
+        self.node_norm = nn.LayerNorm(embed_dim)
+        self.edge_norm = nn.LayerNorm(embed_dim)
+
+    def reset_parameters(self):
+        self.feature_encoder.reset_parameters()
+        for layer in self.encoders:
+            layer.reset_parameters()
+            self.node_norm.reset_parameters()
+            self.edge_norm.reset_parameters()
+
+    def forward(self, X, E, H, edge_weight=None):
+        """
+
+        Args:
+            X: 节点特征
+            E: 边特征
+            H: 邻接矩阵
+            edge_weight: 超边权重
 
         Returns:
-            x: dict
+
         """
-        X = {}
-        E = {}
-        for n in self.name_lst:  # dp和m
-            # 这里需要随机从簇里抽出一部分超边
-            if self.training:
-                # selected_adj, selected_edge_weight = self.hyperedge_select(adj[n], self.cluster_matrix[n], edge_weight[n], self.n_select)
-                selected_adj, selected_edge_weight = adj[n], edge_weight[n]
-            else:
-                selected_adj, selected_edge_weight = adj[n], edge_weight[n]
+        side_encodings, ke_bias = self.feature_encoder()
+        pe_encoding, se_encoding, ke_encoding = side_encodings['pe'], side_encodings['se'], side_encodings['ke']
+        X = X + pe_encoding + se_encoding + ke_encoding
+        X_lst = [X]
+        E_lst = [E]
+        for i in range(self.n_layers):
+            layer = self.encoders[i]
+            X, E = layer(X, E, H, edge_weight, ke_bias)
+            X_lst.append(X)
+            E_lst.append(E)
+        X = sum(X_lst) / (self.n_layers + 1)
+        E = sum(E_lst) / (self.n_layers + 1)
 
-            edges = self.get_hyperedge_representation(x[n], selected_adj)
-            X[n], E[n] = self.graph_encoder[n](x[n], edges, selected_adj, selected_edge_weight)
-            # adj_index = adj[n].indices()
-            # hyperedge_attr = self.get_hyperedge_representation(x[n], adj[n])
-            # x[n] = self.layernorm_1[n](x[n] + self.graph_encoder[n](x[n], adj_index, hyperedge_attr=hyperedge_attr))
-            # x[n] = self.layernorm_2[n](x[n] + self.ffn[n](x[n]))
-        # 将三个图上的超边拼接起来,这里要注意,因为有辅助超边信息,很可能没办法直接拼起来,需要将前面ehr的部分取出来
-        # 假设有一个变量self.n_ehr_edges,记录了所有的visit数量
-        if self.training:
-            # ehr_size = min(self.n_ehr_edges, self.n_clusters)
-            ehr_size = self.n_ehr_edges
-        else:
-            ehr_size = self.n_ehr_edges
-        # idx = 265
-        # E_ehr = torch.cat([E['diag'][:ehr_size], E['proc'][:ehr_size], E['med'][:ehr_size]], dim=-1)
-        E_ehr = {
-            'dp': E['diag'][:ehr_size] + E['proc'][:ehr_size],
-            'm': E['med'][:ehr_size]
-        }
-        # 这里执行聚类
-        if self.training:
-            E_mem = E_ehr
-            # E_mem, mem2ehr = self.edges_cluster(E_ehr)
-        else:
-            E_mem = E_ehr
-            # E_mem, mem2ehr = self.edges_cluster(E_ehr)
+        X = self.node_norm(X)
+        E = self.edge_norm(E)
 
-        # cluster_ssl = self.cluster_SSL(E_ehr, E_mem, mem2ehr)
-        # cluster_ssl = self.ssl_reg * cluster_ssl
-        # assert E_mem.shape == (self.n_protos, self.embedding_dim * 3)
-        return X, E, E_mem
+        return X, E
 
-    def encode(self):
-        # 首先是embedding层
-        raw_embedding = self.get_embedding()  # dict
-        # 最开始是超图编码层
-        X_hat, E_hat, E_mem = self.graph_encode(raw_embedding, self.adj_dict, self.edge_weight_dict)
-        # 将X_hat表示成visit-level
-        return X_hat, E_hat, E_mem
 
-    def compute_loss(self):
-        # dp与m之间做InfoNCE
-        X_hat, E_hat, E_mem = self.encode()
-        edge_ssl_loss = self.edge_ssl_loss(E_mem)
-
-        # E_mem['m']与包含的药物之间应该也做InfoNCE
-        # 这里的问题是如何将解码阶段多头注意力的权重引入进来
-        dp2med_ssl_loss = self.dp2med_ssl_loss(E_mem, X_hat)
-
-        # 节点与聚类中心之间做InfoNCE,能让节点更靠近
-        dp_centroids, dp_edge2cluster = self.edges_cluster(E_mem['dp'])
-        m_centroids, m_edge2cluster = self.edges_cluster(E_mem['m'])
-        dp_cluster_ssl = self.cluster_ssl(E_mem['dp'], dp_centroids, dp_edge2cluster)
-        m_cluster_ssl = self.cluster_ssl(E_mem['m'], m_centroids, m_edge2cluster)
-
-        # 超边表示与节点之间做InfoNCE,将edge表示与node表示统一起来
-        ## 邻接矩阵左乘X,然后乘度矩阵
-        node2edge_ssl = self.node2edge_ssl(X_hat, E_mem)
-
-        ssl_loss = edge_ssl_loss * self.domain_ssl_weight \
-                   + (dp_cluster_ssl + m_cluster_ssl) * self.cluster_ssl_weight \
-                   + node2edge_ssl * self.node2edge_ssl_weight\
-                   + dp2med_ssl_loss * self.dp2med_ssl_weight
-        return ssl_loss
-
-    def node2edge_ssl(self, X_hat, E_mem):
-        edge_embed = {}
-        for n in self.name_lst:
-            node_in_edge = self.node_in_edge[n]
-            padding_row = self.embedding[n](
-                torch.tensor(self.num_dict[n], dtype=torch.long, device=self.device)).reshape(1, self.embedding_dim)
-            X_hat[n] = torch.vstack([X_hat[n], padding_row])
-            edge_embed_with_node = X_hat[n][node_in_edge]
-            edge_embed_agg = self.node2edge_agg[n](edge_embed_with_node).squeeze(1)
-            edge_embed[n] = edge_embed_agg
-
-        # 计算dp表示
-        dp_edge_embedding = edge_embed['diag'] + edge_embed['proc']
-        m_edge_embedding = edge_embed['med']
-        dp_ssl_loss = self.info_nce_loss(dp_edge_embedding, E_mem['dp'])
-        m_ssl_loss = self.info_nce_loss(m_edge_embedding, E_mem['m'])
-        ssl_loss = dp_ssl_loss + m_ssl_loss
-        return ssl_loss
-
-    def cluster_ssl(self, edges, centroids, edge2cluster):
-        norm_edges = F.normalize(edges)
-        edge2centroids = centroids[edge2cluster]
-
-        pos_score = torch.mul(norm_edges, edge2centroids).sum(dim=1)
-        pos_score = torch.exp(pos_score / self.ssl_temp)
-        ttl_score = torch.matmul(norm_edges, centroids.transpose(0, 1))
-        ttl_score = torch.exp(ttl_score / self.ssl_temp).sum(dim=1)
-
-        proto_nce_loss = -torch.log(pos_score / ttl_score).mean()
-        return proto_nce_loss
-
-    def edges_cluster(self, x):
-        """Run K-means algorithm to get k clusters of the input tensor x
-        https://github.com/RUCAIBox/NCL/blob/master/ncl.py
+class Node2EdgeAggregator(nn.Module):
+    def __init__(self, embed_dim, n_heads, dropout):
+        super(Node2EdgeAggregator, self).__init__()
+        self.embed_dim = embed_dim
+        self.n_heads = n_heads
+        self.dropout = dropout
+        self.mha = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=n_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        self._ff_block = FeedForwardLayer(embed_dim, dropout)
+    def forward(self, x):
         """
-        # k = min(self.n_protos, x.shape[0])
-        kmeans = faiss.Kmeans(d=self.embedding_dim, k=self.n_protos, gpu=True)
-        x = x.detach().cpu()
-        kmeans.train(x)
-        cluster_cents = kmeans.centroids
 
-        _, I = kmeans.index.search(x, 1)
+        Args:
+            x: bsz, max_size, dim
 
-        # convert to cuda Tensors for broadcast
-        centroids = torch.Tensor(cluster_cents).to(self.device)
-        centroids = F.normalize(centroids, p=2, dim=1)
+        Returns:
 
-        node2cluster = torch.LongTensor(I).squeeze().to(self.device)
-        return centroids, node2cluster
+        """
+        # 首先使用平均计算超边表示,然后将节点表示和超边表示拼接起来计算注意力
+        bsz, max_size, dim = x.shape
+        hyperedge_attr = x.mean(1, keepdim=True)   # bsz, 1, dim
+        hyperedge_attr = self.norm1(self._sa_block(hyperedge_attr, x, x) + hyperedge_attr)
+        out = self.norm2(self._ff_block(hyperedge_attr) + hyperedge_attr)
+        return out
 
-    def edge_ssl_loss(self, E_mem):
-        dp = E_mem['dp']
-        m = E_mem['m']
-        loss = self.info_nce_loss(dp, m)
-        return loss.mean()
-
-    def dp2med_ssl_loss(self, E_mem, X_hat):
-        dp_edge = E_mem['dp']
-        meds = self.get_hyperedge_representation(X_hat['med'], self.adj_dict['med'])
-        meds = meds[:self.n_ehr_edges, :]
-        loss = self.info_nce_loss(dp_edge, meds)
-        return loss
-
+    def _sa_block(self, q, k, v):
+        attn_visit, attn = self.mha(
+            query=q,
+            key=k,
+            value=v,
+            need_weights=True
+        )
+        return attn_visit

@@ -10,7 +10,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .HypergraphGPSEncoder import Node2EdgeAggregator
+from .hgt_encoder import Node2EdgeAggregator
 from info_nce import InfoNCE
 from .ehr_memory_attn import EHRMemoryAttention, HistoryAttention
 from .moe import MoEPredictor
@@ -32,24 +32,19 @@ class HGTDecoder(nn.Module):
                 X_hat[n] = torch.vstack([X_hat[n].to(device), padding_row])
 
         self.X_hat = nn.ModuleDict({
-            n: nn.Embedding(voc_size_dict[n] + 1, embedding_dim).from_pretrained(X_hat[n].to(device), freeze=False)
+            # n: nn.Embedding(voc_size_dict[n] + 1, embedding_dim).from_pretrained(torch.randn_like(X_hat[n]).to(device), freeze=False, padding_idx=padding_dict[n])
+            n: nn.Embedding(voc_size_dict[n] + 1, embedding_dim).from_pretrained(X_hat[n].to(device), freeze=True, padding_idx=padding_dict[n])
             for n in self.name_lst
         })
+        E_mem = {
+            'dp': E_mem['diag'] + E_mem['proc'],
+            'm': E_mem['med']
+        }
         self.E_mem = nn.ModuleDict({
-            n: nn.Embedding(E_mem[n].shape[0], embedding_dim).from_pretrained(E_mem[n].to(device), freeze=False)
+            # n: nn.Embedding(E_mem[n].shape[0], embedding_dim).from_pretrained(torch.randn_like(E_mem[n]).to(device), freeze=False)
+            n: nn.Embedding(E_mem[n].shape[0], embedding_dim).from_pretrained(E_mem[n].to(device), freeze=True)
             for n in ['dp', 'm']
         })
-        # self.X_hat = nn.ParameterDict({
-        #     k: nn.Parameter(v).to(device)
-        #     # k: nn.Parameter(torch.randn_like(v)).to(device)
-        #     for k, v in X_hat.items()
-        # })
-        # self.E_mem = {k: v.to(device) for k, v in E_mem.items()}
-        # self.E_mem = nn.ParameterDict({
-        #     k: nn.Parameter(v).to(device)
-        #     # k: nn.Parameter(torch.randn_like(v)).to(device)
-        #     for k, v in E_mem.items()
-        # })
 
         self.tensor_ddi_adj = ddi_adj.to(device)
         self.embedding_norm = nn.ModuleDict(
@@ -167,7 +162,7 @@ class HGTDecoder(nn.Module):
         self.gate_control = nn.Sequential(
             nn.Linear(3 * embedding_dim, 3 * embedding_dim),
             nn.Dropout(dropout),
-            nn.Tanh()
+            # nn.Tanh()
         )
 
         self.info_nce_loss = InfoNCE(reduction='mean')
@@ -286,6 +281,7 @@ class HGTDecoder(nn.Module):
             -1)
         gate = self.gate_control(cat_rep.reshape(-1, 3 * mem_context_rep.shape[-1])).reshape(-1, mem_context_rep.shape[-1], 3)
         assert len(gate.shape) == 3 and gate.shape[-1] == 3
+        gate = torch.softmax(gate, -1)
         fusion_rep = (gate * cat_rep).sum(-1)
         fusion_output, fusion_moe_loss = self.fusion_moe_preditor(fusion_rep)
         output = self.fusion_pred_norm(fusion_output)

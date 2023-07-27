@@ -28,8 +28,12 @@ class HypergraphStructureEncoding(nn.Module):
             self.encodings = encodings
         self.encodings = self.encodings.to(device)
 
-        self.norm = nn.BatchNorm1d(len(statistics_name) + 1)
+        self.norm = nn.LayerNorm(len(statistics_name) + 1)
         self.proj = nn.Linear(len(statistics_name) + 1, se_dim)
+
+    def reset_parameters(self):
+        self.norm.reset_parameters()
+        self.proj.reset_parameters()
 
     def compute_node_degree(self):
         node_degree = tsp.sum(self.zero_one_H, dim=1).to_dense()
@@ -128,8 +132,13 @@ class HypergraphKnowledgeEncoding(nn.Module):
 
         max_dist = torch.max(self.ke_dist_matrix).long().item()
         self.encoding = nn.Embedding(max_dist + 1, 1)
-        self.norm = nn.BatchNorm1d(self.n_nodes)
+        self.norm = nn.LayerNorm(self.n_nodes)
         self.proj = nn.Linear(self.n_nodes, ke_dim)
+
+    def reset_parameters(self):
+        self.encoding.reset_parameters()
+        self.norm.reset_parameters()
+        self.proj.reset_parameters()
 
     def icd_dist(self, u, v):
         u_icd, v_icd = self.idx2word[u], self.idx2word[v]
@@ -216,8 +225,12 @@ class HypergraphPositionEncoding(nn.Module):
             self.encodings = encodings
         self.encodings = self.encodings.to(device)
 
-        self.norm = nn.BatchNorm1d(self.pe_dim * 2)
+        self.norm = nn.LayerNorm(self.pe_dim * 2)
         self.proj = nn.Linear(self.pe_dim * 2, self.pe_dim)
+
+    def reset_parameters(self):
+        self.norm.reset_parameters()
+        self.proj.reset_parameters()
 
     def compute_laplacian_matrix(self):
         """
@@ -278,6 +291,11 @@ class FeatureEncoder(nn.Module):
                                                        device, name)
         self.name = name
 
+    def reset_parameters(self):
+        self.se_encoding.reset_parameters()
+        self.pe_encoding.reset_parameters()
+        self.ke_encoding.reset_parameters()
+
     def forward(self):
         se_encoding = self.se_encoding()
         ke_encoding, ke_bias = self.ke_encoding()
@@ -291,46 +309,46 @@ class FeatureEncoder(nn.Module):
         return encodings, ke_bias
 
 
-class HypergraphRandomWalkPositionEncoding(nn.Module):
-    def __init__(self, max_step, pos_enc_dim):
-        super(HypergraphRandomWalkPositionEncoding, self).__init__()
-        self.pos_enc_dim = pos_enc_dim
-        self.max_step = max_step
-        self.pe_lin = nn.Linear(max_step, pos_enc_dim)
-
-    def init_positional_encoding(self, H):
-        """
-            Initializing positional encoding with RWPE
-        """
-        n, e = H.shape
-        adj_v = torch.ones_like(H.values())
-        adj = torch.sparse_coo_tensor(H.indices(), adj_v, size=H.shape)
-        D_v_inv_v = (tsp.sum(adj, dim=1) ** -1).values()
-        D_v_inv_i = torch.arange(D_v_inv_v.shape[0]).repeat(2, 1).to(D_v_inv_v.device)
-        D_v_inv = torch.sparse_coo_tensor(D_v_inv_i, D_v_inv_v, size=(n, n))
-        assert D_v_inv.shape == (n, n)
-        D_e_inv_v = (tsp.sum(adj, dim=0) ** -1).values()
-        D_e_inv_i = torch.arange(D_e_inv_v.shape[0]).repeat(2, 1).to(D_e_inv_v.device)
-        D_e_inv = torch.sparse_coo_tensor(D_e_inv_i, D_e_inv_v, size=(e, e))
-        assert D_e_inv.shape == (e, e)
-
-        # Geometric diffusion features with Random Walk
-        RW = D_v_inv @ H @ D_e_inv @ H.T
-        M = RW
-
-        # Iterate
-        nb_pos_enc = self.max_step
-        PE = [M.to_dense().diagonal().float()]
-        M_power = M
-        for _ in range(nb_pos_enc - 1):
-            # E.g. The first row of M_power means probabilities from node 0 to its neigbors *
-            #      The first col of M means probabilities of node 0's neighbors to node 0 =
-            #      The landing probability of a node i to itself
-            M_power = M_power @ M
-            PE.append(M_power.to_dense().diagonal().float())
-        PE = torch.stack(PE, dim=-1)
-        # num_node * pos_enc_dim 第一行表示这张图的第一个节点游走了1,2, ... k次之后返回自身的概率
-        # 以此作为该节点的位置编码
-        PE = self.pe_lin(PE)
-        assert PE.shape == (n, self.pos_enc_dim)
-        return PE
+# class HypergraphRandomWalkPositionEncoding(nn.Module):
+#     def __init__(self, max_step, pos_enc_dim):
+#         super(HypergraphRandomWalkPositionEncoding, self).__init__()
+#         self.pos_enc_dim = pos_enc_dim
+#         self.max_step = max_step
+#         self.pe_lin = nn.Linear(max_step, pos_enc_dim)
+#
+#     def init_positional_encoding(self, H):
+#         """
+#             Initializing positional encoding with RWPE
+#         """
+#         n, e = H.shape
+#         adj_v = torch.ones_like(H.values())
+#         adj = torch.sparse_coo_tensor(H.indices(), adj_v, size=H.shape)
+#         D_v_inv_v = (tsp.sum(adj, dim=1) ** -1).values()
+#         D_v_inv_i = torch.arange(D_v_inv_v.shape[0]).repeat(2, 1).to(D_v_inv_v.device)
+#         D_v_inv = torch.sparse_coo_tensor(D_v_inv_i, D_v_inv_v, size=(n, n))
+#         assert D_v_inv.shape == (n, n)
+#         D_e_inv_v = (tsp.sum(adj, dim=0) ** -1).values()
+#         D_e_inv_i = torch.arange(D_e_inv_v.shape[0]).repeat(2, 1).to(D_e_inv_v.device)
+#         D_e_inv = torch.sparse_coo_tensor(D_e_inv_i, D_e_inv_v, size=(e, e))
+#         assert D_e_inv.shape == (e, e)
+#
+#         # Geometric diffusion features with Random Walk
+#         RW = D_v_inv @ H @ D_e_inv @ H.T
+#         M = RW
+#
+#         # Iterate
+#         nb_pos_enc = self.max_step
+#         PE = [M.to_dense().diagonal().float()]
+#         M_power = M
+#         for _ in range(nb_pos_enc - 1):
+#             # E.g. The first row of M_power means probabilities from node 0 to its neigbors *
+#             #      The first col of M means probabilities of node 0's neighbors to node 0 =
+#             #      The landing probability of a node i to itself
+#             M_power = M_power @ M
+#             PE.append(M_power.to_dense().diagonal().float())
+#         PE = torch.stack(PE, dim=-1)
+#         # num_node * pos_enc_dim 第一行表示这张图的第一个节点游走了1,2, ... k次之后返回自身的概率
+#         # 以此作为该节点的位置编码
+#         PE = self.pe_lin(PE)
+#         assert PE.shape == (n, self.pos_enc_dim)
+#         return PE
